@@ -319,7 +319,7 @@ def _cli() -> None:
         levels = build_dca_levels(band)
         print("dca_levels", levels)
         basket = HedgeBasket(
-            primary=HedgeLeg(symbol="BTC/USDT", side="long", target_notional_usdt=1000.0),
+            primary=HedgeLeg(symbol="BTC/USDT", side="long", target_notional_usdt=400.0),
             hedge=HedgeLeg(symbol="ETH/USDT", side="short", target_notional_usdt=350.0),
             hedge_ratio=0.35,
         )
