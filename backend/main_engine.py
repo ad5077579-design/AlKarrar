@@ -50,6 +50,8 @@ class EngineSettings(BaseSettings):
     binance_api_key: str = ""
     binance_api_secret: str = ""
     binance_testnet: bool = True
+    #: If ``True`` with ``binance_testnet``, use legacy ``testnet.binancefuture.com`` instead of Unified Demo ``demo-fapi.binance.com``.
+    binance_legacy_futures_testnet: bool = False
 
 
 class Side(str, Enum):
