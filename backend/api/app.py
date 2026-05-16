@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select
 
-from backend.api import futures_account_sync, futures_user_stream, mark_feed
+from backend.api import mark_feed, spot_account_sync, spot_user_stream
 from backend.api.bot_hub import hub
 from backend.api.routers import api_router, dashboard
 from backend.api.ws_endpoint import websocket_dashboard
@@ -46,15 +46,26 @@ async def lifespan(app: FastAPI):
         if row and row.config_json:
             merged = {**hub.snapshot_defaults(), **dict(row.config_json)}
             await hub.replace_state(merged)
-    await futures_account_sync.sync_futures_account_to_hub_once()
+    try:
+        await spot_account_sync.sync_spot_account_to_hub_once()
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).warning("initial spot sync failed", exc_info=True)
     stop = asyncio.Event()
     mark_task = asyncio.create_task(mark_feed.run_mark_price_feed(stop), name="mark-feed")
-    acct_task = asyncio.create_task(futures_account_sync.run_account_sync_loop_env(stop), name="acct-sync")
+    acct_task = asyncio.create_task(spot_account_sync.run_account_sync_loop_env(stop), name="acct-sync")
     user_task = asyncio.create_task(
-        futures_user_stream.run_futures_user_stream(stop, bot_id="default"),
+        spot_user_stream.run_spot_user_stream(stop, bot_id="default"),
         name="user-stream",
     )
     yield
+    try:
+        from backend.api.grid_manager import grid_manager
+
+        await grid_manager.stop_all()
+    except Exception:
+        pass
     stop.set()
     mark_task.cancel()
     acct_task.cancel()
@@ -91,3 +102,6 @@ def create_app() -> FastAPI:
     app.include_router(dashboard.emergency_router, prefix="/api", tags=["emergency"])
     app.websocket("/ws")(websocket_dashboard)
     return app
+
+
+app = create_app()

@@ -1,5 +1,5 @@
 """
-Run AlKarrar_Pro_Shifting_Grid once for DOGEUSDT (Binance USD-M), then clean up.
+Run AlKarrar_Pro_Shifting_Grid once for DOGEUSDT (Binance Spot), then clean up.
 
 Examples:
   python -m backend.cli.run_doge_grid_once --dry-run
@@ -7,7 +7,7 @@ Examples:
   python -m backend.cli.run_doge_grid_once --micro-roundtrip
 
 Requires ``.env`` with ``BINANCE_API_KEY`` / ``BINANCE_API_SECRET`` unless ``--dry-run``.
-Default: ``BINANCE_TESTNET=true`` (set ``BINANCE_TESTNET=false`` for mainnet — not recommended here).
+Default: ``BINANCE_TESTNET=true`` (Spot Testnet — keys from testnet.binance.vision).
 """
 
 from __future__ import annotations
@@ -15,9 +15,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-import math
 import sys
 from typing import Any
+
+from backend.core.exchange_filters import fetch_symbol_filters, normalize_order
 
 _log = logging.getLogger("run_doge_grid_once")
 
@@ -30,66 +31,24 @@ def _setup_logging() -> None:
     )
 
 
-async def _symbol_filters(client: Any, symbol: str) -> dict[str, Any]:
-    info = await client.raw.futures_exchange_info()
-    symbols = info.get("symbols") if isinstance(info, dict) else None
-    if not isinstance(symbols, list):
-        raise RuntimeError("unexpected exchange_info")
-    for row in symbols:
-        if isinstance(row, dict) and row.get("symbol") == symbol:
-            return row
-    raise ValueError(f"symbol not listed: {symbol}")
+async def _micro_roundtrip(client: Any, symbol: str, price: float, filters: dict[str, float]) -> None:
+    from backend.core.exchange_filters import min_trade_qty
 
-
-def _quantize_qty(qty: float, step: float, min_qty: float) -> float:
-    if step <= 0:
-        q = max(qty, min_qty)
-    else:
-        q = math.floor(qty / step) * step
-        if q < min_qty - 1e-12:
-            q = math.ceil(min_qty / step) * step
-    decimals = 8
-    if step < 1 and step > 0:
-        decimals = min(8, max(0, int(round(-math.log10(step))) + 2))
-    return round(q, decimals)
-
-
-async def _min_trade_qty(client: Any, symbol: str, price: float) -> float:
-    row = await _symbol_filters(client, symbol)
-    filters = row.get("filters") or []
-    step = 1.0
-    min_qty = 1.0
-    min_notional = 5.0
-    for f in filters:
-        if not isinstance(f, dict):
-            continue
-        ft = f.get("filterType")
-        if ft == "LOT_SIZE":
-            step = float(f.get("stepSize", step))
-            min_qty = float(f.get("minQty", min_qty))
-        elif ft == "MIN_NOTIONAL":
-            min_notional = float(f.get("notional", f.get("minNotional", min_notional)))
-    q = max(min_qty, min_notional / max(price, 1e-12))
-    return _quantize_qty(q, step, min_qty)
-
-
-async def _micro_roundtrip(client: Any, symbol: str, price: float) -> None:
-    qty = await _min_trade_qty(client, symbol, price)
-    _log.info("micro_roundtrip qty=%s (min rules)", qty)
+    qty = min_trade_qty(price, filters)
+    qty_s = normalize_order(price, qty, filters)[1]
+    _log.info("micro_roundtrip qty=%s", qty_s)
     await client.create_order(
         symbol=symbol,
         side="BUY",
         order_type="MARKET",
-        quantity=qty,
-        reduce_only=False,
+        quantity=qty_s,
     )
     await asyncio.sleep(0.75)
     await client.create_order(
         symbol=symbol,
         side="SELL",
         order_type="MARKET",
-        quantity=qty,
-        reduce_only=True,
+        quantity=qty_s,
     )
 
 
@@ -99,10 +58,10 @@ async def _run(args: argparse.Namespace) -> int:
     bot_id = "doge-grid-once"
 
     if args.dry_run:
-        _log.info("dry-run: would trade %s on testnet=%s", symbol, not args.mainnet)
+        _log.info("dry-run: would trade %s on spot testnet=%s", symbol, not args.mainnet)
         return 0
 
-    from backend.core.binance_client import BinanceFuturesClient
+    from backend.core.binance_client import BinanceSpotClient
     from backend.main_engine import EngineSettings
     from backend.strategies.alkarrar_pro_shifting_grid import AlKarrarProShiftingGridStrategy
 
@@ -111,17 +70,19 @@ async def _run(args: argparse.Namespace) -> int:
         _log.error("Missing BINANCE_API_KEY / BINANCE_API_SECRET in environment or .env")
         return 2
 
-    testnet = settings.binance_testnet and not args.mainnet
-    legacy = settings.binance_legacy_futures_testnet
+    if args.mainnet:
+        spot_env = "mainnet"
+    else:
+        spot_env = settings.resolved_binance_env()
     client: Any = None
     strategy: Any = None
     try:
-        client = await BinanceFuturesClient.create_for_paper_or_mainnet(
+        client = await BinanceSpotClient.create_for_env(
             api_key=settings.binance_api_key,
             api_secret=settings.binance_api_secret,
-            paper=testnet,
-            legacy_futures_testnet=legacy,
+            env=spot_env,
         )
+        filters = await fetch_symbol_filters(client, symbol)
         t = await client.fetch_ticker(symbol)
         price = float(
             t.get("lastPrice") or t.get("last") or t.get("price") or t.get("close") or 0
@@ -147,6 +108,7 @@ async def _run(args: argparse.Namespace) -> int:
         }
 
         strategy = AlKarrarProShiftingGridStrategy(client)
+        strategy._quantize_hooks = lambda p, q: normalize_order(p, q, filters)  # type: ignore[attr-defined]
         await strategy.on_start(bot_id, strat_settings)
         _log.info("strategy started mark≈%s band [%.6f, %.6f]", price, lower, upper)
 
@@ -154,15 +116,15 @@ async def _run(args: argparse.Namespace) -> int:
 
         for i in range(int(args.tick_steps)):
             bump = 1.0 + (i + 1) * 0.0022
-            await strategy.on_tick(bot_id, {"mark": price * bump, "realized_delta": 0.0})
+            await strategy.on_tick(bot_id, {"mark": price * bump, "price": price * bump})
             await asyncio.sleep(0.35)
 
         if args.micro_roundtrip:
-            await _micro_roundtrip(client, symbol, price)
+            await _micro_roundtrip(client, symbol, price, filters)
 
         await asyncio.sleep(0.5)
         try:
-            await client.raw.futures_cancel_all_open_orders(symbol=symbol)
+            await client.cancel_all_open_orders(symbol=symbol)
             _log.info("cancelled all open orders for %s", symbol)
         except Exception:
             _log.exception("cancel_all_open_orders failed")
@@ -182,7 +144,7 @@ async def _run(args: argparse.Namespace) -> int:
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Run DOGEUSDT shifting grid once (Binance Futures).")
+    p = argparse.ArgumentParser(description="Run DOGEUSDT shifting grid once (Binance Spot).")
     p.add_argument("--dry-run", action="store_true", help="Do not connect to Binance.")
     p.add_argument("--mainnet", action="store_true", help="Use mainnet (overrides testnet env default).")
     p.add_argument("--levels", type=int, default=5, help="generatorCount for the grid.")
@@ -192,7 +154,7 @@ def main() -> None:
     p.add_argument(
         "--micro-roundtrip",
         action="store_true",
-        help="After grid, place minimum MARKET BUY then MARKET SELL reduce-only (requires margin).",
+        help="After grid, place minimum MARKET BUY then MARKET SELL (Spot wallet).",
     )
     args = p.parse_args()
     try:

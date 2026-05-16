@@ -1,8 +1,7 @@
-"""Binance USD-M Futures via python-binance AsyncClient (async)."""
+"""Binance Spot via python-binance AsyncClient (async)."""
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
 from typing import Any
@@ -11,30 +10,21 @@ import aiohttp
 from binance import AsyncClient
 
 from backend.core.base_exchange import BaseExchange
+from backend.core.binance_env import (
+    BinanceSpotEnv,
+    env_display_label,
+    normalize_binance_env,
+    spot_stream_endpoint,
+)
 
 _log = logging.getLogger(__name__)
-
-# Reference URLs (python-binance picks hosts via ``testnet`` / ``demo`` on AsyncClient).
-USD_M_FUTURES_REST_MAINNET = "https://fapi.binance.com"
-# Unified Demo USD-M REST root; python-binance appends ``/v{version}/`` + path (do not add ``/v1`` here).
-USD_M_FUTURES_REST_DEMO = "https://demo-fapi.binance.com/fapi"
-USD_M_FUTURES_REST_TESTNET = "https://testnet.binancefuture.com/fapi"
-USD_M_FUTURES_WS_USER_MAINNET = "wss://fstream.binance.com/ws/<listenKey>"
-USD_M_FUTURES_WS_USER_TESTNET = "wss://fstream.binancefuture.com/ws/<listenKey>"
-USD_M_FUTURES_WS_USER_UNIFIED_DEMO = "wss://demo-fstream.binance.com/ws/<listenKey>"
-# Optional marker on ``AsyncClient`` (library does not define it); used for debugging / parity with REST host.
-UNIFIED_USDM_DEMO_FUTURES_STREAM_WS = "wss://demo-fstream.binance.com/ws"
 
 
 def _aiohttp_session_params_for_dns(
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """
-    Prefer threaded DNS (getaddrinfo) over aiodns.
+    import asyncio
 
-    On some Windows setups aiohttp's default AsyncResolver fails with
-    ``Could not contact DNS servers`` even when the system browser resolves Binance fine.
-    """
     loop = asyncio.get_running_loop()
     out: dict[str, Any] = {
         "connector": aiohttp.TCPConnector(
@@ -48,120 +38,62 @@ def _aiohttp_session_params_for_dns(
     return out
 
 
-def futures_client_flags(*, paper: bool, legacy_futures_testnet: bool) -> tuple[bool, bool]:
-    """
-    Map UI/env "paper" keys to ``BinanceFuturesClient.create`` flags ``(testnet, demo_semantic)``.
-
-    - Mainnet: ``(False, False)``
-    - Unified Binance Demo (demo.binance.com keys): ``(False, True)`` → REST/WS routed manually to
-      ``demo-fapi`` / ``demo-fstream`` (we never pass ``AsyncClient(..., demo=True)``).
-    - Legacy USD-M testnet: ``(True, False)`` → ``testnet.binancefuture.com``
-    """
-    if not paper:
-        return False, False
-    if legacy_futures_testnet:
-        return True, False
-    return False, True
-
-
-def _apply_unified_usdm_demo_urls(raw: AsyncClient) -> None:
-    """Point USD-M REST + stream marker at Unified Demo without enabling library ``demo=True`` (avoids ``demo-api`` spot)."""
-    # Base must match ``_create_futures_api_uri``: ``{base}/v1/ping`` etc. (do not bake ``/v1`` into the base).
-    raw.FUTURES_URL = USD_M_FUTURES_REST_DEMO
-    setattr(raw, "FUTURES_STREAM_URL", UNIFIED_USDM_DEMO_FUTURES_STREAM_WS)
-
-
-def parse_usdm_futures_balances(acc: dict[str, Any]) -> dict[str, float]:
-    """
-    Map ``GET /fapi/v2/account`` (``futures_account``) top-level fields to hub / UI.
-
-    Uses Binance field names exactly — no synthetic substitutes for ``availableBalance``.
-    ``currentCapital`` / ``marginBalance`` remain aliases used elsewhere in the app.
-
-    Returns: ``totalWalletBalance``, ``totalMarginBalance``, ``availableBalance``, ``floatingPnl``,
-    plus aliases ``currentCapital`` (= wallet) and ``marginBalance`` (= total margin).
-    """
-    def _to_f(key: str) -> float | None:
-        if key not in acc or acc.get(key) is None:
-            return None
-        try:
-            return float(acc[key])
-        except (TypeError, ValueError):
-            return None
-
-    tw = _to_f("totalWalletBalance")
-    tm = _to_f("totalMarginBalance")
-    av_top = _to_f("availableBalance")
-    unreal = _to_f("totalUnrealizedProfit")
-
-    wallet = tw if tw is not None else (tm if tm is not None else 0.0)
-    margin = tm if tm is not None else wallet
-    if unreal is None:
-        unreal = 0.0
-
-    avail: float | None = av_top
-    if avail is None and isinstance(acc.get("assets"), list):
-        for row in acc["assets"]:
-            if not isinstance(row, dict):
-                continue
-            if str(row.get("asset", "")).upper() != "USDT":
-                continue
-            try:
-                if row.get("availableBalance") is not None:
-                    avail = float(row["availableBalance"])
-                elif row.get("walletBalance") is not None:
-                    avail = float(row["walletBalance"])
-            except (TypeError, ValueError):
-                avail = None
-            break
-    if avail is None:
-        avail = 0.0
-
-    return {
-        "totalWalletBalance": wallet,
-        "totalMarginBalance": margin,
-        "availableBalance": avail,
-        "floatingPnl": unreal,
-        "currentCapital": wallet,
-        "marginBalance": margin,
-    }
-
-
-def _coerce_futures_server_time_ms(res: Any) -> int:
-    """``GET /fapi/v1/time`` returns ``{"serverTime": ...}``; tolerate plain int if the client unwraps."""
+def _coerce_server_time_ms(res: Any) -> int:
     if isinstance(res, dict):
         v = res.get("serverTime", res.get("server_time"))
         if v is None:
-            raise TypeError(f"unexpected futures time payload: {res!r}")
+            raise TypeError(f"unexpected time payload: {res!r}")
         return int(v)
     return int(res)
 
 
-class BinanceFuturesClient(BaseExchange):
+def parse_spot_balances(acc: dict[str, Any]) -> dict[str, float]:
+    """Map ``GET /api/v3/account`` balances to hub fields (USDT wallet)."""
+    free_usdt = 0.0
+    locked_usdt = 0.0
+    for row in acc.get("balances") or []:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("asset", "")).upper() != "USDT":
+            continue
+        try:
+            free_usdt = float(row.get("free") or 0)
+            locked_usdt = float(row.get("locked") or 0)
+        except (TypeError, ValueError):
+            pass
+        break
+    total = free_usdt + locked_usdt
+    return {
+        "totalWalletBalance": total,
+        "totalMarginBalance": total,
+        "availableBalance": free_usdt,
+        "floatingPnl": 0.0,
+        "currentCapital": total,
+        "marginBalance": total,
+    }
+
+
+def spot_stream_host(*, env: BinanceSpotEnv | None = None, testnet: bool | None = None) -> str:
+    """Public WS host for ticker streams (legacy ``testnet=`` or ``env=``)."""
+    if env is None:
+        env = "testnet" if testnet else "mainnet"
+    host, _port = spot_stream_endpoint(env)
+    return host
+
+
+class BinanceSpotClient(BaseExchange):
     """
-    Thin async adapter over python-binance futures endpoints.
+    Thin async adapter over Binance **Spot** REST + user stream.
 
-    - ``testnet=False, demo=False`` → production ``fapi.binance.com``.
-    - ``testnet=False, demo=True`` (semantic flag from ``futures_client_flags``) → **Unified Binance Demo**
-      ``demo-fapi.binance.com``: we keep ``AsyncClient(..., demo=False)`` and patch ``FUTURES_URL`` so the
-      library never switches spot/margin to ``demo-api.binance.com`` or pings spot during init.
-    - ``testnet=True, demo=False`` → legacy futures testnet ``testnet.binancefuture.com``.
-
-    We do **not** use ``AsyncClient.create()``: that pings **spot** first. We construct ``AsyncClient``
-    directly and set ``timestamp_offset`` from ``futures_time()`` only (USD-M REST only; no spot
-    ``exchangeInfo`` / ``ping``).
-
-    HTTP uses ``ThreadedResolver`` by default so DNS goes through the OS stack (avoids aiodns
-    ``Could not contact DNS servers`` on some Windows machines). Pass ``session_params`` to override.
-
-    Use ``await BinanceFuturesClient.create(...)`` then ``await client.aclose()`` in ``finally``.
+    Environment is selected via ``BINANCE_ENV`` (``mainnet`` | ``testnet`` | ``demo``)
+    or legacy ``paper`` / ``BINANCE_TESTNET`` (testnet vs mainnet only).
     """
 
-    __slots__ = ("_raw", "_unified_usdm_demo")
+    __slots__ = ("_raw", "_env")
 
-    def __init__(self, raw: AsyncClient, *, unified_usdm_demo: bool = False) -> None:
+    def __init__(self, raw: AsyncClient, *, env: BinanceSpotEnv = "mainnet") -> None:
         self._raw = raw
-        self._unified_usdm_demo = unified_usdm_demo
+        self._env = env
 
     @classmethod
     async def create(
@@ -169,40 +101,47 @@ class BinanceFuturesClient(BaseExchange):
         api_key: str | None = None,
         api_secret: str | None = None,
         *,
-        testnet: bool = False,
-        demo: bool = False,
+        env: BinanceSpotEnv = "mainnet",
         requests_params: dict[str, Any] | None = None,
         session_params: dict[str, Any] | None = None,
-    ) -> BinanceFuturesClient:
-        """
-        Build a client. Keys may be omitted for public endpoints only (e.g. ping).
-
-        Do not set ``testnet=True`` and ``demo=True`` together.
-
-        ``demo=True`` here means "Unified USD-M Demo" (demo.binance.com keys). It is **not** passed as
-        ``AsyncClient(demo=True)``, which would repoint spot/WS helpers to ``demo-api.binance.com``.
-        """
-        if testnet and demo:
-            raise ValueError("choose only one of testnet=True or demo=True for BinanceFuturesClient")
-        unified_usdm_demo = bool(demo) and not bool(testnet)
+    ) -> BinanceSpotClient:
+        use_testnet = env == "testnet"
+        use_demo = env == "demo"
+        if use_testnet and use_demo:
+            raise ValueError("invalid env")
         raw = AsyncClient(
             api_key or None,
             api_secret or None,
-            testnet=testnet,
-            demo=False,
+            testnet=use_testnet,
+            demo=use_demo,
             requests_params=requests_params,
             session_params=_aiohttp_session_params_for_dns(session_params),
         )
-        if unified_usdm_demo:
-            _apply_unified_usdm_demo_urls(raw)
         try:
-            # Skip AsyncClient.create(): it calls spot ping + get_server_time (wrong host for futures-only).
-            ft = _coerce_futures_server_time_ms(await raw.futures_time())
-            raw.timestamp_offset = ft - int(time.time() * 1000)
+            st = _coerce_server_time_ms(await raw.get_server_time())
+            raw.timestamp_offset = st - int(time.time() * 1000)
         except BaseException:
             await raw.close_connection()
             raise
-        return cls(raw, unified_usdm_demo=unified_usdm_demo)
+        return cls(raw, env=env)
+
+    @classmethod
+    async def create_for_env(
+        cls,
+        api_key: str | None,
+        api_secret: str | None,
+        *,
+        env: BinanceSpotEnv,
+        requests_params: dict[str, Any] | None = None,
+        session_params: dict[str, Any] | None = None,
+    ) -> BinanceSpotClient:
+        return await cls.create(
+            api_key,
+            api_secret,
+            env=env,
+            requests_params=requests_params,
+            session_params=session_params,
+        )
 
     @classmethod
     async def create_for_paper_or_mainnet(
@@ -211,92 +150,167 @@ class BinanceFuturesClient(BaseExchange):
         api_secret: str | None,
         *,
         paper: bool,
-        legacy_futures_testnet: bool = False,
+        env: BinanceSpotEnv | None = None,
+        legacy_futures_testnet: bool = False,  # ignored — spot only
         requests_params: dict[str, Any] | None = None,
         session_params: dict[str, Any] | None = None,
-    ) -> BinanceFuturesClient:
-        """Convenience: ``paper`` matches dashboard ``binanceTestnet`` / ``BINANCE_TESTNET`` (non-mainnet keys)."""
-        tn, dm = futures_client_flags(paper=paper, legacy_futures_testnet=legacy_futures_testnet)
+    ) -> BinanceSpotClient:
+        _ = legacy_futures_testnet
+        resolved = env if env is not None else ("testnet" if paper else "mainnet")
         return await cls.create(
             api_key,
             api_secret,
-            testnet=tn,
-            demo=dm,
+            env=resolved,
             requests_params=requests_params,
             session_params=session_params,
         )
 
     @property
     def raw(self) -> AsyncClient:
-        """Escape hatch for advanced calls not wrapped here."""
         return self._raw
 
     @property
-    def unified_usdm_demo(self) -> bool:
-        """True when REST is routed to Unified Demo (``demo-fapi``); WebSockets must use ``demo-fstream``."""
-        return self._unified_usdm_demo
+    def env(self) -> BinanceSpotEnv:
+        return self._env
 
-    def futures_user_data_stream_url(self, listen_key: str) -> str:
-        """USD-M user data WebSocket URL for legacy testnet vs mainnet vs Unified Demo."""
-        raw = self._raw
-        if getattr(raw, "testnet", False):
-            return f"wss://fstream.binancefuture.com/ws/{listen_key}"
-        if self._unified_usdm_demo:
-            return f"wss://demo-fstream.binance.com/ws/{listen_key}"
-        return f"wss://fstream.binance.com/ws/{listen_key}"
+    @property
+    def testnet(self) -> bool:
+        """True when REST uses testnet.binance.vision (not demo)."""
+        return self._env == "testnet"
 
-    async def futures_listen_key_create(self) -> str:
-        return await self._raw.futures_stream_get_listen_key()
+    @property
+    def demo(self) -> bool:
+        return self._env == "demo"
 
-    async def futures_listen_key_keepalive(self, listen_key: str) -> None:
-        await self._raw.futures_stream_keepalive(listen_key)
+    def user_data_stream_url(self, listen_key: str) -> str:
+        host, port = spot_stream_endpoint(self._env)
+        return f"wss://{host}{port}/ws/{listen_key}"
 
-    async def futures_listen_key_close(self, listen_key: str) -> None:
-        await self._raw.futures_stream_close(listen_key)
+    async def listen_key_create(self) -> str:
+        return await self._raw.stream_get_listen_key()
+
+    async def listen_key_keepalive(self, listen_key: str) -> None:
+        await self._raw.stream_keepalive(listen_key)
+
+    async def listen_key_close(self, listen_key: str) -> None:
+        await self._raw.stream_close(listen_key)
 
     async def ping(self) -> Any:
-        return await self._raw.futures_ping()
+        return await self._raw.ping()
 
     async def fetch_server_time_ms(self) -> int:
-        return _coerce_futures_server_time_ms(await self._raw.futures_time())
+        return _coerce_server_time_ms(await self._raw.get_server_time())
 
     async def fetch_ticker(self, symbol: str) -> dict[str, Any]:
-        data = await self._raw.futures_symbol_ticker(symbol=symbol)
+        data = await self._raw.get_symbol_ticker(symbol=symbol)
         if not isinstance(data, dict):
-            raise TypeError("unexpected futures_symbol_ticker payload")
-        return data
+            raise TypeError("unexpected get_symbol_ticker payload")
+        price = data.get("price")
+        return {**data, "lastPrice": price, "price": price}
 
-    async def futures_klines(
+    async def get_klines(
         self,
         *,
         symbol: str,
         interval: str,
         limit: int = 500,
     ) -> list[Any]:
-        """USD-M public klines (same shape as ``GET /fapi/v1/klines``)."""
-        return await self._raw.futures_klines(symbol=symbol, interval=interval, limit=limit)
+        return await self._raw.get_klines(symbol=symbol, interval=interval, limit=limit)
 
-    async def fetch_positions(self) -> list[dict[str, Any]]:
-        data = await self._raw.futures_position_information()
+    async def get_exchange_info(self) -> dict[str, Any]:
+        data = await self._raw.get_exchange_info()
+        if not isinstance(data, dict):
+            raise TypeError("unexpected get_exchange_info payload")
+        return data
+
+    async def get_tickers_24hr(self) -> list[dict[str, Any]]:
+        data = await self._raw.get_ticker()
         if not isinstance(data, list):
-            raise TypeError("unexpected futures_position_information payload")
+            raise TypeError("unexpected get_ticker payload")
         return [row for row in data if isinstance(row, dict)]
 
+    async def get_account_trades(
+        self,
+        *,
+        symbol: str,
+        limit: int = 100,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+        from_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {"symbol": symbol, "limit": max(1, min(int(limit), 1000))}
+        if from_id is not None:
+            params["fromId"] = int(from_id)
+        if start_time_ms is not None:
+            params["startTime"] = int(start_time_ms)
+        if end_time_ms is not None:
+            params["endTime"] = int(end_time_ms)
+        data = await self._raw.get_my_trades(**params)
+        if not isinstance(data, list):
+            raise TypeError("unexpected get_my_trades payload")
+        return [row for row in data if isinstance(row, dict)]
+
+    async def get_open_orders(self, symbol: str) -> list[dict[str, Any]]:
+        data = await self._raw.get_open_orders(symbol=symbol)
+        if not isinstance(data, list):
+            raise TypeError("unexpected get_open_orders payload")
+        return [row for row in data if isinstance(row, dict)]
+
+    async def get_all_open_orders(self) -> list[dict[str, Any]]:
+        """Open orders across all symbols (Spot ``GET /api/v3/openOrders`` without symbol)."""
+        data = await self._raw.get_open_orders()
+        if not isinstance(data, list):
+            raise TypeError("unexpected get_open_orders payload")
+        return [row for row in data if isinstance(row, dict)]
+
+    async def cancel_all_open_orders(self, symbol: str) -> Any:
+        return await self._raw.cancel_all_open_orders(symbol=symbol)
+
+    async def cancel_order(self, symbol: str, order_id: int) -> Any:
+        return await self._raw.cancel_order(symbol=symbol, orderId=order_id)
+
+    async def fetch_positions(self) -> list[dict[str, Any]]:
+        """Spot has no futures positions — non-zero wallet balances only."""
+        acc = await self.fetch_account()
+        out: list[dict[str, Any]] = []
+        for row in acc.get("balances") or []:
+            if not isinstance(row, dict):
+                continue
+            try:
+                free = float(row.get("free") or 0)
+                locked = float(row.get("locked") or 0)
+            except (TypeError, ValueError):
+                continue
+            qty = free + locked
+            if qty <= 0:
+                continue
+            asset = str(row.get("asset", "")).upper()
+            if asset in ("USDT", "BUSD", "USDC"):
+                continue
+            out.append({"asset": asset, "quantity": qty, "free": free, "locked": locked})
+        return out
+
     async def fetch_account(self) -> dict[str, Any]:
-        data = await self._raw.futures_account()
+        data = await self._raw.get_account()
         if not isinstance(data, dict):
-            raise TypeError("unexpected futures_account payload")
+            raise TypeError("unexpected get_account payload")
         return data
 
     async def fetch_account_balance(self) -> dict[str, float]:
-        """
-        Live wallet snapshot from ``GET /fapi/v2/account`` (via ``futures_account``).
+        return parse_spot_balances(await self.fetch_account())
 
-        Returns: totalWalletBalance, totalMarginBalance, availableBalance, floatingPnl,
-        plus aliases currentCapital (= wallet) and marginBalance (= total margin).
-        """
-        acc = await self.fetch_account()
-        return parse_usdm_futures_balances(acc)
+    def base_asset_free(self, acc: dict[str, Any], symbol: str) -> float:
+        sym = symbol.upper().replace("/", "")
+        base = sym[:-4] if sym.endswith("USDT") else sym
+        for row in acc.get("balances") or []:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("asset", "")).upper() == base:
+                try:
+                    return float(row.get("free") or 0)
+                except (TypeError, ValueError):
+                    return 0.0
+        return 0.0
 
     async def create_order(
         self,
@@ -310,6 +324,7 @@ class BinanceFuturesClient(BaseExchange):
         reduce_only: bool | None = None,
         **extra: Any,
     ) -> dict[str, Any]:
+        _ = reduce_only  # spot has no reduce-only flag
         params: dict[str, Any] = {
             "symbol": symbol,
             "side": side.upper(),
@@ -321,13 +336,31 @@ class BinanceFuturesClient(BaseExchange):
             params["price"] = price
         if time_in_force is not None:
             params["timeInForce"] = time_in_force
-        if reduce_only is not None:
-            params["reduceOnly"] = reduce_only
-        data = await self._raw.futures_create_order(**params)
+        data = await self._raw.create_order(**params)
         if not isinstance(data, dict):
-            raise TypeError("unexpected futures_create_order payload")
-        _log.info("futures_order_created symbol=%s orderId=%s", symbol, data.get("orderId"))
+            raise TypeError("unexpected create_order payload")
+        _log.info(
+            "spot_order_created env=%s symbol=%s orderId=%s",
+            self._env,
+            symbol,
+            data.get("orderId"),
+        )
         return data
 
     async def aclose(self) -> None:
         await self._raw.close_connection()
+
+
+# Re-export for callers
+__all__ = [
+    "BinanceClient",
+    "BinanceSpotClient",
+    "BinanceSpotEnv",
+    "env_display_label",
+    "normalize_binance_env",
+    "parse_spot_balances",
+    "spot_stream_host",
+]
+
+# Single client type for the whole app (spot-only).
+BinanceClient = BinanceSpotClient

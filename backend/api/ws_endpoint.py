@@ -15,7 +15,9 @@ async def websocket_dashboard(ws: WebSocket) -> None:
     await hub.register(ws)
     try:
         while True:
-            await ws.receive_text()
+            raw = await ws.receive_text()
+            if raw.strip().lower() in ("ping", '{"type":"ping"}'):
+                await ws.send_text("pong")
     except WebSocketDisconnect:
         _log.debug("ws client disconnected")
     finally:

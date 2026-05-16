@@ -1,3 +1,1 @@
-from backend.api.app import create_app
-
-app = create_app()
+"""FastAPI BFF package. Use ``backend.api.app:app`` as the ASGI entrypoint (not ``backend.api:app``)."""

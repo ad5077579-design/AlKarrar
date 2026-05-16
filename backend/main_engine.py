@@ -45,13 +45,28 @@ def _setup_logging() -> None:
 class EngineSettings(BaseSettings):
     """Runtime configuration from environment (no secrets in repo)."""
 
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=str(project_root() / ".env"),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     binance_api_key: str = ""
     binance_api_secret: str = ""
+    #: ``mainnet`` | ``testnet`` | ``demo`` — overrides ``BINANCE_TESTNET`` when set.
+    binance_env: str = ""
     binance_testnet: bool = True
-    #: If ``True`` with ``binance_testnet``, use legacy ``testnet.binancefuture.com`` instead of Unified Demo ``demo-fapi.binance.com``.
+    #: Ignored (Spot-only app). Kept so older ``.env`` files still load.
     binance_legacy_futures_testnet: bool = False
+
+    def resolved_binance_env(self) -> Literal["mainnet", "testnet", "demo"]:
+        from backend.core.binance_env import normalize_binance_env
+
+        raw = self.binance_env.strip() if self.binance_env else ""
+        return normalize_binance_env(
+            raw if raw else None,
+            testnet_fallback=bool(self.binance_testnet),
+        )
 
 
 class Side(str, Enum):

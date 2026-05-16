@@ -1,217 +1,227 @@
 <script setup lang="ts">
+import AuditLogPanel from "~/components/AuditLogPanel.vue"
+import BotAssignedActivityPanel from "~/components/BotAssignedActivityPanel.vue"
 import { useBotStore } from "~/stores/bot"
 
 const store = useBotStore()
+
+function closeTradesJournal() {
+  store.tradesViewSymbol = null
+}
+
 /** Defer chart mount until dashboard (symbol + balances) is hydrated from the API. */
 const dashboardLoaded = ref(false)
-const saving = ref(false)
-const killing = ref(false)
-
-const form = reactive({
-  generatorUpper: 0,
-  generatorLower: 0,
-  generatorCount: 5,
-  initialCapital: 100,
-})
-
-watch(
-  () => ({
-    u: store.generatorUpper,
-    l: store.generatorLower,
-    c: store.generatorCount,
-    i: store.initialCapital,
-  }),
-  (v) => {
-    form.generatorUpper = v.u
-    form.generatorLower = v.l
-    form.generatorCount = v.c
-    form.initialCapital = v.i
-  },
-  { immediate: true },
-)
+const dashTab = ref<"main" | "audit">("main")
+const auditPanelRef = ref<{ refresh: () => Promise<void> } | null>(null)
 
 onMounted(async () => {
-  await store.fetchDashboard()
-  dashboardLoaded.value = true
   store.connectWs()
+  await store.bootstrapDashboard()
+  dashboardLoaded.value = true
 })
 
 onBeforeUnmount(() => {
   store.disconnectWs()
 })
 
-async function onSave() {
-  saving.value = true
-  try {
-    await store.saveSettings({
-      generatorUpper: form.generatorUpper,
-      generatorLower: form.generatorLower,
-      generatorCount: form.generatorCount,
-      initialCapital: form.initialCapital,
-    })
-  } finally {
-    saving.value = false
+watch(dashTab, (t) => {
+  if (t === "audit") {
+    void auditPanelRef.value?.refresh?.()
   }
-}
-
-async function onKill() {
-  if (!confirm("تأكيد: إيقاف طوارئ — إلغاء الأوامر وإغلاق المراكز بسعر السوق؟")) return
-  killing.value = true
-  try {
-    await store.emergencyStop()
-  } finally {
-    killing.value = false
-  }
-}
+})
 </script>
 
 <template>
-  <main class="dash">
-    <header class="dash-header">
-      <div class="title-row">
-        <h1>AlKarrar Pro</h1>
-        <span
-          v-if="store.credentialsConfigured && store.exchangeTestnet"
-          class="testnet-badge"
-          title="ورق / ديمو — مفاتيح من demo.binance.com (REST: demo-fapi.binance.com)"
-        >
-          Testnet Mode
-        </span>
-      </div>
-      <div class="conn" :class="{ ok: store.wsConnected, bad: !store.wsConnected }">
-        WS: {{ store.wsConnected ? "live" : "offline" }}
-        <span v-if="store.lastWsAt && store.wsConnected" class="muted tiny">
-          · آخر حدث: {{ new Date(store.lastWsAt).toLocaleTimeString() }}
-        </span>
-        <span v-if="store.wsError" class="err">{{ store.wsError }}</span>
-      </div>
-    </header>
-
-    <section class="balance-hero panel">
-      <div class="balance-hero-head">
-        <h2>رصيد الحساب (حي)</h2>
-        <span class="sym-pill">{{ store.symbol }}</span>
-      </div>
-      <p class="muted balance-hint">
-        يُحدَّث عند التحميل من REST (<code>futures_account</code>) ثم عبر WebSocket: أحداث User Stream تطلق
-        مزامنة كاملة وتبث <code>metrics</code> بقيم <code>totalWalletBalance</code> / <code>totalMarginBalance</code> / <code>availableBalance</code>.
-      </p>
-      <div class="balance-cards">
-        <div class="balance-card">
-          <div class="balance-label">Available Balance</div>
-          <div class="balance-num">{{ store.availableBalance.toFixed(2) }} <span class="unit">USDT</span></div>
+  <div class="app-shell">
+    <SymbolSidebar />
+    <main class="dash">
+      <header class="dash-header">
+        <div class="title-row">
+          <h1>AlKarrar Pro</h1>
+          <span v-if="store.credentialsConfigured" class="spot-badge">Spot</span>
+          <span
+            v-if="store.credentialsConfigured"
+            class="env-badge"
+            :class="store.binanceEnv || (store.exchangeTestnet ? 'testnet' : 'mainnet')"
+          >
+            {{ store.spotEnvLabelAr }} · {{ store.spotEnvLabel }}
+          </span>
+          <span v-if="store.activeGridSymbols.length" class="grid-live-badge">
+            {{ store.activeGridSymbols.length === 1 ? "شبكة نشطة" : `${store.activeGridSymbols.length} شبكات` }}
+          </span>
         </div>
-        <div class="balance-card">
-          <div class="balance-label">Total Margin Balance</div>
-          <div class="balance-num">{{ store.totalMarginBalance.toFixed(2) }} <span class="unit">USDT</span></div>
+        <div class="header-meta">
+          <div class="conn" :class="{ ok: store.wsConnected, bad: !store.wsConnected }">
+            WS {{ store.wsConnected ? "live" : "offline" }}
+            <span v-if="store.lastWsAt && store.wsConnected" class="muted tiny">
+              · {{ new Date(store.lastWsAt).toLocaleTimeString() }}
+            </span>
+          </div>
+          <span v-if="store.credentialsConfigured" class="key-preview muted tiny">
+            {{ store.binanceApiKeyPreview }}
+          </span>
         </div>
-        <div class="balance-card">
-          <div class="balance-label">Total Wallet Balance</div>
-          <div class="balance-num">{{ store.totalWalletBalance.toFixed(2) }} <span class="unit">USDT</span></div>
-        </div>
-      </div>
-    </section>
+      </header>
 
-    <section class="panel cred-env-panel">
-      <h2>اتصال Binance (السيرفر)</h2>
-      <p class="muted">
-        تُقرأ المفاتيح من ملف <code>.env</code> عند تشغيل الـ API:
-        <code>BINANCE_API_KEY</code>، <code>BINANCE_API_SECRET</code>، <code>BINANCE_TESTNET</code>
-        (ورق/ديمو: <a href="https://demo.binance.com" target="_blank" rel="noopener">demo.binance.com</a>
-        → <code>demo-fapi.binance.com</code>). إن وُجدت مفاتيح في قاعدة البيانات فلها الأولوية على <code>.env</code>.
-        راجع <code>.env.example</code>. إذا ظهر <strong>WS: offline</strong> فتأكد أن الـ API يعمل على المنفذ
-        <code>8090</code> أو عيّن <code>NUXT_PUBLIC_WS_URL=ws://127.0.0.1:8090/ws</code> في بيئة الواجه.
-      </p>
-      <div v-if="store.syncError" class="sync-err" role="alert">
-        <strong>مزامنة Binance:</strong> {{ store.syncError }}
-      </div>
-      <div v-else-if="store.syncOkAt" class="sync-ok muted">آخر مزامنة ناجحة: {{ store.syncOkAt }}</div>
-      <div v-if="store.credentialsConfigured" class="key-status">
-        مفعّل: <code>{{ store.binanceApiKeyPreview }}</code> —
-        {{ store.binanceTestnetStored ? "Demo / Testnet" : "Mainnet" }}
-      </div>
-      <div v-else class="sync-err" role="alert">
-        لا توجد مفاتيح صالحة في <code>.env</code> أو قاعدة البيانات. أضف القيم وأعد تشغيل خادم الـ API.
-      </div>
-    </section>
-
-    <section class="grid-cards panel metrics">
-      <div>
-        <div class="metric-label">Realized PnL</div>
-        <div class="metric-value">{{ store.realizedPnl.toFixed(4) }}</div>
-      </div>
-      <div>
-        <div class="metric-label">Floating PnL</div>
-        <div class="metric-value">{{ store.floatingPnl.toFixed(4) }}</div>
-      </div>
-      <div>
-        <div class="metric-label">Wallet Balance</div>
-        <div class="metric-value">{{ store.totalWalletBalance.toFixed(2) }}</div>
-      </div>
-      <div>
-        <div class="metric-label">Active Grid Lines</div>
-        <div class="metric-value">{{ store.activeGridLines }}</div>
-      </div>
-      <div>
-        <div class="metric-label">Mark</div>
-        <div class="metric-value">{{ store.markPrice.toFixed(6) }}</div>
-      </div>
-    </section>
-
-    <section class="chart-wrap panel">
-      <h2 class="chart-title">الشموع — {{ store.symbol }} (5m)</h2>
-      <ClientOnly>
-        <TradingChart v-if="dashboardLoaded" />
-        <div v-else class="chart-fallback">جاري تحميل الإعدادات والرسم…</div>
-        <template #fallback>
-          <div class="chart-fallback">جاري تحميل الرسم…</div>
+      <div
+        v-if="store.syncError || !store.apiReachable || !store.credentialsConfigured"
+        class="status-banner"
+        role="alert"
+      >
+        <template v-if="!store.apiReachable">
+          خادم API غير متاح — شغّل <code>.\scripts\run_api.ps1</code>
         </template>
-      </ClientOnly>
-    </section>
-
-    <section class="controls">
-      <form class="panel form-grid" @submit.prevent="onSave">
-        <h2>إعدادات الشبكة (BFF)</h2>
-        <label>
-          <span class="metric-label">generatorUpper</span>
-          <input v-model.number="form.generatorUpper" class="field" type="number" step="any" required />
-        </label>
-        <label>
-          <span class="metric-label">generatorLower</span>
-          <input v-model.number="form.generatorLower" class="field" type="number" step="any" required />
-        </label>
-        <label>
-          <span class="metric-label">generatorCount</span>
-          <input v-model.number="form.generatorCount" class="field" type="number" min="2" required />
-        </label>
-        <label>
-          <span class="metric-label">initialCapital</span>
-          <input v-model.number="form.initialCapital" class="field" type="number" step="any" min="0.01" required />
-        </label>
-        <button class="btn btn-primary" type="submit" :disabled="saving">
-          {{ saving ? "…" : "حفظ وإرسال" }}
-        </button>
-      </form>
-
-      <div class="panel kill-wrap">
-        <h2>Kill Switch</h2>
-        <p class="muted">POST /api/emergency_stop — إلغاء الأوامر وإغلاق المراكز (MARKET)</p>
-        <button class="btn btn-danger" type="button" :disabled="killing" @click="onKill">
-          {{ killing ? "…" : "إيقاف طوارئ" }}
-        </button>
+        <template v-else-if="!store.credentialsConfigured">
+          لا توجد مفاتيح — عيّن <code>BINANCE_API_KEY</code> و <code>BINANCE_ENV</code> في <code>.env</code> ثم أعد تشغيل API
+        </template>
+        <template v-else-if="store.syncError">
+          {{ store.syncError }}
+          <span v-if="store.syncErrorHint" class="status-hint"> — {{ store.syncErrorHint }}</span>
+        </template>
       </div>
-    </section>
-  </main>
+
+      <nav class="dash-tabs" role="tablist" aria-label="أقسام اللوحة">
+        <button
+          type="button"
+          role="tab"
+          :aria-selected="dashTab === 'main'"
+          class="dash-tab"
+          :class="{ active: dashTab === 'main' }"
+          @click="dashTab = 'main'"
+        >
+          لوحة التداول
+        </button>
+        <button
+          type="button"
+          role="tab"
+          :aria-selected="dashTab === 'audit'"
+          class="dash-tab"
+          :class="{ active: dashTab === 'audit' }"
+          @click="dashTab = 'audit'"
+        >
+          سجل العمليات
+        </button>
+      </nav>
+
+      <template v-if="dashTab === 'main'">
+      <section class="balance-hero panel">
+        <div class="balance-hero-head">
+          <h2>رصيد الحساب</h2>
+          <span class="sym-pill">{{ store.symbol }}</span>
+        </div>
+        <div class="balance-cards">
+          <div class="balance-card">
+            <div class="balance-label">رصيد USDT متاح</div>
+            <div class="balance-num">
+              {{ store.availableBalance.toFixed(2) }} <span class="unit">USDT</span>
+            </div>
+          </div>
+          <div class="balance-card">
+            <div class="balance-label">إجمالي محفظة USDT</div>
+            <div class="balance-num">
+              {{ store.totalWalletBalance.toFixed(2) }} <span class="unit">USDT</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="grid-cards panel metrics">
+        <div>
+          <div class="metric-label">سعر Mark</div>
+          <div class="metric-value">{{ store.markPrice > 0 ? store.markPrice.toFixed(6) : "—" }}</div>
+        </div>
+        <div>
+          <div class="metric-label">ربح محقق</div>
+          <div class="metric-value" :class="store.realizedPnl >= 0 ? 'pnl-up' : 'pnl-down'">
+            {{ store.realizedPnl >= 0 ? "+" : "" }}{{ store.realizedPnl.toFixed(4) }}
+          </div>
+        </div>
+        <div>
+          <div class="metric-label">خطوط الشبكة</div>
+          <div class="metric-value">
+            {{ store.generatorCount }}
+            <span class="muted"> / {{ store.maxGeneratorCount }}</span>
+          </div>
+        </div>
+        <div>
+          <div class="metric-label">المزامنة</div>
+          <div class="metric-value metric-sm">{{ store.syncError ? "خطأ" : store.syncOkAt ? "OK" : "—" }}</div>
+        </div>
+      </section>
+
+      <section class="chart-wrap panel">
+        <h2 class="chart-title">الشموع — {{ store.symbol }} (15m)</h2>
+        <ClientOnly>
+          <TradingChart v-if="dashboardLoaded" />
+          <div v-else class="chart-fallback">جاري تحميل الإعدادات والرسم…</div>
+          <template #fallback>
+            <div class="chart-fallback">جاري تحميل الرسم…</div>
+          </template>
+        </ClientOnly>
+      </section>
+
+      <GridSettingsPanel v-if="dashboardLoaded" />
+
+      <p
+        v-if="dashboardLoaded && store.credentialsConfigured && !store.showLiveBotPanels"
+        class="idle-hint muted"
+      >
+        لا شبكة نشطة ولا أوامر معلّقة — سجل الصفقات وسجل العمليات في تبويب
+        <button type="button" class="idle-hint-link" @click="dashTab = 'audit'">سجل العمليات</button>.
+      </p>
+
+      <ActiveGridCards v-if="dashboardLoaded && store.activeGridSymbols.length" />
+
+      <div
+        v-if="dashboardLoaded && store.tradesViewSymbol"
+        id="grid-trades-journal"
+      >
+        <TradeJournal
+          :symbol="store.tradesViewSymbol"
+          :since="store.gridsBySymbol[store.tradesViewSymbol]?.startedAt"
+          embedded
+          @close="closeTradesJournal"
+        />
+      </div>
+
+      <BotAssignedActivityPanel
+        v-if="
+          dashboardLoaded &&
+          store.credentialsConfigured &&
+          store.showLiveBotPanels &&
+          !store.activeGridSymbols.length
+        "
+      />
+      </template>
+
+      <template v-else>
+        <TradeJournal v-if="dashboardLoaded" />
+        <AuditLogPanel ref="auditPanelRef" />
+      </template>
+    </main>
+  </div>
 </template>
 
 <style scoped>
+.app-shell {
+  display: flex;
+  min-height: 100vh;
+  align-items: stretch;
+}
 .dash {
+  flex: 1;
+  min-width: 0;
   max-width: 1200px;
   margin: 0 auto;
   padding: 1rem 1.25rem 2rem;
   display: flex;
   flex-direction: column;
   gap: 1rem;
+}
+@media (max-width: 960px) {
+  .app-shell {
+    flex-direction: column;
+  }
 }
 .dash-header {
   display: flex;
@@ -226,16 +236,72 @@ async function onKill() {
   gap: 0.65rem;
   flex-wrap: wrap;
 }
-.testnet-badge {
+.header-meta {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.2rem;
+}
+.key-preview {
+  font-variant-numeric: tabular-nums;
+}
+.spot-badge {
   font-size: 0.7rem;
   font-weight: 700;
   letter-spacing: 0.06em;
   text-transform: uppercase;
   padding: 0.28rem 0.6rem;
   border-radius: 6px;
+  background: rgba(14, 203, 129, 0.15);
+  color: #34d399;
+  border: 1px solid rgba(14, 203, 129, 0.45);
+}
+.env-badge {
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 0.28rem 0.55rem;
+  border-radius: 6px;
+  border: 1px solid transparent;
+}
+.env-badge.demo {
+  background: rgba(56, 189, 248, 0.14);
+  color: #7dd3fc;
+  border-color: rgba(56, 189, 248, 0.4);
+}
+.env-badge.testnet {
   background: rgba(245, 158, 11, 0.18);
   color: #fbbf24;
-  border: 1px solid rgba(245, 158, 11, 0.5);
+  border-color: rgba(245, 158, 11, 0.5);
+}
+.env-badge.mainnet {
+  background: rgba(14, 203, 129, 0.12);
+  color: #34d399;
+  border-color: rgba(14, 203, 129, 0.45);
+}
+.grid-live-badge {
+  font-size: 0.68rem;
+  font-weight: 700;
+  padding: 0.28rem 0.55rem;
+  border-radius: 6px;
+  background: rgba(14, 203, 129, 0.2);
+  color: #0ecb81;
+  animation: pulse-grid 1.8s ease-in-out infinite;
+}
+@keyframes pulse-grid {
+  50% {
+    opacity: 0.65;
+  }
+}
+.pnl-up {
+  color: #0ecb81;
+}
+.pnl-down {
+  color: #f6465d;
+}
+.metric-sm {
+  font-size: 1rem;
 }
 .tiny {
   font-size: 0.72rem;
@@ -255,10 +321,48 @@ async function onKill() {
 .conn.bad {
   color: var(--warn);
 }
-.err {
-  display: block;
-  color: var(--danger);
-  font-size: 0.75rem;
+.status-banner {
+  background: rgba(246, 70, 93, 0.12);
+  border: 1px solid rgba(246, 70, 93, 0.45);
+  border-radius: 8px;
+  padding: 0.55rem 0.85rem;
+  font-size: 0.82rem;
+  color: #ffb4c0;
+  line-height: 1.45;
+}
+.status-banner code {
+  font-size: 0.78rem;
+}
+.status-hint {
+  color: #fde68a;
+}
+.dash-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  padding: 0.15rem;
+  background: rgba(15, 18, 22, 0.65);
+  border: 1px solid #2b3139;
+  border-radius: 8px;
+}
+.dash-tab {
+  border: 1px solid transparent;
+  background: transparent;
+  color: #848e9c;
+  font-size: 0.82rem;
+  font-weight: 600;
+  padding: 0.45rem 0.85rem;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.dash-tab:hover {
+  color: #eaecef;
+  background: rgba(43, 49, 57, 0.5);
+}
+.dash-tab.active {
+  color: #f0b90b;
+  border-color: rgba(240, 185, 11, 0.45);
+  background: rgba(240, 185, 11, 0.08);
 }
 .balance-hero h2 {
   margin: 0;
@@ -270,6 +374,7 @@ async function onKill() {
   justify-content: space-between;
   gap: 0.75rem;
   flex-wrap: wrap;
+  margin-bottom: 0.75rem;
 }
 .sym-pill {
   font-size: 0.75rem;
@@ -281,12 +386,9 @@ async function onKill() {
   color: #7dd3fc;
   border: 1px solid rgba(56, 189, 248, 0.35);
 }
-.balance-hint {
-  margin: 0.35rem 0 0.85rem;
-}
 .balance-cards {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(2, 1fr);
   gap: 0.75rem;
 }
 @media (max-width: 720px) {
@@ -299,12 +401,6 @@ async function onKill() {
   border: 1px solid rgba(56, 189, 248, 0.15);
   border-radius: 12px;
   padding: 1rem 1.1rem;
-}
-.balance-card.neg {
-  border-color: rgba(246, 70, 93, 0.35);
-}
-.balance-card.pos {
-  border-color: rgba(14, 203, 129, 0.35);
 }
 .balance-label {
   font-size: 0.72rem;
@@ -341,61 +437,55 @@ async function onKill() {
   justify-content: center;
   color: var(--muted);
 }
-.controls {
-  display: grid;
-  grid-template-columns: 1fr 280px;
-  gap: 1rem;
-}
-@media (max-width: 900px) {
-  .controls {
-    grid-template-columns: 1fr;
-  }
-}
-.form-grid {
-  display: flex;
-  flex-direction: column;
-  gap: 0.65rem;
-}
-.cred-env-panel h2 {
-  margin: 0 0 0.35rem;
-  font-size: 1rem;
-}
-.cred-env-panel a {
-  color: #38bdf8;
-}
-.sync-err {
-  background: rgba(246, 70, 93, 0.12);
-  border: 1px solid rgba(246, 70, 93, 0.45);
-  border-radius: 8px;
-  padding: 0.65rem 0.85rem;
-  margin-bottom: 0.75rem;
-  font-size: 0.85rem;
-  color: #ffb4c0;
-}
-.sync-ok {
-  margin-bottom: 0.5rem;
-}
-.key-status {
-  font-size: 0.85rem;
-  margin-bottom: 0.75rem;
-  color: var(--accent);
-}
-button.btn-secondary {
-  background: #2a3340;
-  color: var(--text);
-}
-.form-grid h2,
-.kill-wrap h2 {
-  margin: 0 0 0.35rem;
-  font-size: 1rem;
-}
 .muted {
   color: var(--muted);
-  font-size: 0.8rem;
-  margin: 0 0 0.75rem;
 }
-.kill-wrap {
+.active-grids-title {
+  margin: 0 0 0.65rem;
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: #e2e8f0;
+}
+.active-grids-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
   display: flex;
   flex-direction: column;
+  gap: 0.45rem;
+}
+.active-grids-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.5rem 0.65rem;
+  border-radius: 8px;
+  background: rgba(34, 197, 94, 0.08);
+  border: 1px solid rgba(34, 197, 94, 0.25);
+}
+.ag-sym {
+  font-weight: 700;
+  font-size: 0.85rem;
+  letter-spacing: 0.03em;
+}
+.idle-hint {
+  margin: 0;
+  font-size: 0.8rem;
+  line-height: 1.5;
+  padding: 0.55rem 0.75rem;
+  border-radius: 8px;
+  background: rgba(43, 49, 57, 0.35);
+  border: 1px solid rgba(43, 49, 57, 0.6);
+}
+.idle-hint-link {
+  background: none;
+  border: none;
+  padding: 0;
+  color: #7dd3fc;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  text-decoration: underline;
 }
 </style>

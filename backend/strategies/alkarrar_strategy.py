@@ -1,4 +1,7 @@
 """
+DEPRECATED: legacy USD-M futures strategy — not used by the Spot dashboard.
+Kept for reference only; do not import in new code.
+
 AlKarrar Pro — streaming-first futures strategy (mark price + user data WebSockets).
 
 Design goals (millisecond-sensitive path):

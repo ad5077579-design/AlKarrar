@@ -1,32 +1,27 @@
-"""
-Binance USD-M: account + mark price via the **same API keys** (DB per bot, else ``.env``).
-
-``fetch_account_balance`` (wallet / margin / available) runs each tick; positions are reconciled
-against the exchange. ``fetch_ticker`` is isolated so mark updates can succeed if account fails.
-"""
+"""Binance Spot: account balance + ticker → hub + WebSocket."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Any
 
 from backend.api.bot_hub import hub
-from backend.api.credential_resolver import get_binance_keys
-from backend.api.exchange_reconcile import reconcile_positions_for_bot
-from backend.core.binance_client import BinanceFuturesClient
+from backend.api.binance_pool import get_spot_client
+from backend.api.credential_resolver import exchange_testnet_flag, get_binance_keys
 
 _log = logging.getLogger(__name__)
 
 _last_metrics_sig: tuple[float, float, float] | None = None
-_last_mark: float | None = None
+_last_mark_by_symbol: dict[str, float] = {}
 
 
 def reset_sync_dedupe() -> None:
-    global _last_metrics_sig, _last_mark
+    global _last_metrics_sig, _last_mark_by_symbol
     _last_metrics_sig = None
-    _last_mark = None
+    _last_mark_by_symbol.clear()
 
 
 def _f(x: Any) -> float:
@@ -58,30 +53,44 @@ async def _broadcast_metrics(merged: dict[str, Any], *, ts_iso: str, source: str
     )
 
 
-async def sync_futures_account_to_hub_once(
+def _symbols_for_ticker_refresh() -> list[str]:
+    try:
+        from backend.api.grid_manager import grid_manager
+
+        syms = grid_manager.active_symbols()
+    except Exception:
+        syms = []
+    if not syms:
+        fb = str(hub.state.get("symbol") or "DOGEUSDT").upper().replace("/", "")
+        syms = [fb]
+    seen: set[str] = set()
+    out: list[str] = []
+    for s in syms:
+        u = s.upper().replace("/", "")
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+async def sync_spot_account_to_hub_once(
     bot_id: str = "default",
     *,
     metrics_source: str = "rest",
 ) -> None:
-    global _last_metrics_sig, _last_mark
-    key, secret, paper, legacy = await get_binance_keys(bot_id)
+    global _last_metrics_sig, _last_mark_by_symbol
+    key, secret, env, _legacy = await get_binance_keys(bot_id)
     if not key or not secret:
         return
 
-    client: BinanceFuturesClient | None = None
+    client = await get_spot_client(bot_id)
+    if client is None:
+        return
     try:
-        client = await BinanceFuturesClient.create_for_paper_or_mainnet(
-            api_key=key,
-            api_secret=secret,
-            paper=paper,
-            legacy_futures_testnet=legacy,
-        )
-        symbol = str(hub.state.get("symbol") or "DOGEUSDT").upper().replace("/", "")
-
         try:
             bal = await client.fetch_account_balance()
             now_iso = datetime.now(timezone.utc).isoformat()
-            merged = await hub.merge_state(
+            merged = await hub.merge_account(
                 {
                     "totalWalletBalance": bal["totalWalletBalance"],
                     "totalMarginBalance": bal["totalMarginBalance"],
@@ -91,7 +100,8 @@ async def sync_futures_account_to_hub_once(
                     "floatingPnl": bal["floatingPnl"],
                     "syncError": "",
                     "syncOkAt": now_iso,
-                    "exchangeTestnet": bool(paper),
+                    "exchangeTestnet": exchange_testnet_flag(env),
+                    "binanceEnv": env,
                 }
             )
             _last_metrics_sig = (
@@ -100,47 +110,48 @@ async def sync_futures_account_to_hub_once(
                 bal["availableBalance"],
             )
             await _broadcast_metrics(merged, ts_iso=now_iso, source=metrics_source)
-            try:
-                await reconcile_positions_for_bot(bot_id, client, symbol)
-            except Exception:
-                _log.debug("position reconcile failed", exc_info=True)
         except Exception as exc:
             msg = str(exc).strip()[:400] or type(exc).__name__
-            _log.warning("futures account sync failed: %s", msg)
-            await hub.merge_state({"syncError": msg, "exchangeTestnet": bool(paper)})
+            _log.warning("spot account sync failed: %s", msg)
+            await hub.merge_account(
+                {"syncError": msg, "exchangeTestnet": exchange_testnet_flag(env), "binanceEnv": env}
+            )
             await hub.broadcast({"type": "sync_error", "message": msg})
 
-        try:
-            t = await client.fetch_ticker(symbol)
-            mark = _f(t.get("lastPrice") or t.get("price") or t.get("close") or 0)
-            if mark > 0 and mark != _last_mark:
-                _last_mark = mark
-                await hub.merge_state({"markPrice": mark})
-                await hub.broadcast(
-                    {
-                        "type": "mark",
-                        "markPrice": mark,
-                        "t": int(t.get("time", 0) or 0),
-                        "source": "binance_rest",
-                    }
-                )
-        except Exception as exc:
-            msg = str(exc).strip()[:400] or type(exc).__name__
-            _log.warning("futures ticker sync failed: %s", msg)
+        symbol_list = _symbols_for_ticker_refresh()
+        for symbol in symbol_list:
+            try:
+                t = await client.fetch_ticker(symbol)
+                mark = _f(t.get("lastPrice") or t.get("price") or 0)
+                prev = _last_mark_by_symbol.get(symbol, 0.0)
+                if mark > 0 and mark != prev:
+                    _last_mark_by_symbol[symbol] = mark
+                    await hub.merge_room(symbol, {"markPrice": mark})
+                    await hub.broadcast_room(
+                        symbol,
+                        {
+                            "type": "mark",
+                            "markPrice": mark,
+                            "t": int(t.get("time", 0) or 0),
+                            "source": "binance_rest",
+                        },
+                    )
+            except Exception as exc:
+                msg = str(exc).strip()[:400] or type(exc).__name__
+                _log.warning("spot ticker sync failed %s: %s", symbol, msg)
 
     except Exception as exc:
         msg = str(exc).strip()[:400] or type(exc).__name__
-        _log.warning("futures sync client failed: %s", msg)
-        await hub.merge_state({"syncError": msg})
+        _log.warning("spot sync client failed: %s", msg)
+        await hub.merge_account({"syncError": msg})
         await hub.broadcast({"type": "sync_error", "message": msg})
     finally:
-        if client is not None:
-            await client.aclose()
+        pass  # pooled client — do not close per tick
 
 
 async def run_account_sync_loop(stop: asyncio.Event, *, interval_s: float = 4.0) -> None:
     while not stop.is_set():
-        await sync_futures_account_to_hub_once()
+        await sync_spot_account_to_hub_once()
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval_s)
         except TimeoutError:
@@ -148,12 +159,14 @@ async def run_account_sync_loop(stop: asyncio.Event, *, interval_s: float = 4.0)
 
 
 async def run_account_sync_loop_env(stop: asyncio.Event) -> None:
-    import os
-
     if os.getenv("ALKARRAR_ACCOUNT_SYNC", "true").lower() not in ("1", "true", "yes"):
         return
     try:
         interval = float(os.getenv("ALKARRAR_ACCOUNT_SYNC_INTERVAL", "4"))
     except ValueError:
-        interval = 4.0
-    await run_account_sync_loop(stop, interval_s=max(2.0, interval))
+        interval = 2.0
+    await run_account_sync_loop(stop, interval_s=max(1.0, interval))
+
+
+# Back-compat alias (remove when all imports updated)
+sync_futures_account_to_hub_once = sync_spot_account_to_hub_once

@@ -10,9 +10,10 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.api.credential_resolver import get_binance_keys, mask_binance_api_key_preview
+from backend.api.binance_pool import reset_pool_after_credentials_change
+from backend.api.credential_resolver import exchange_testnet_flag, get_binance_keys, mask_binance_api_key_preview
 from backend.api.dependencies import get_db_session
-from backend.api import futures_account_sync
+from backend.api import spot_account_sync
 from backend.database.models.exchange_credential import ExchangeCredential
 
 router = APIRouter()
@@ -29,7 +30,7 @@ class CredentialPayload(BaseModel):
 async def get_credentials_preview(bot_id: str, db: AsyncSession = Depends(get_db_session)) -> dict:
     row = await db.scalar(select(ExchangeCredential).where(ExchangeCredential.bot_id == bot_id))
     db_active = bool(row and row.api_key.strip() and row.api_secret.strip())
-    k1, k2, paper, _ = await get_binance_keys(bot_id)
+    k1, k2, env, _ = await get_binance_keys(bot_id)
     if not (k1 and k2):
         return {
             "hasKeys": False,
@@ -48,7 +49,8 @@ async def get_credentials_preview(bot_id: str, db: AsyncSession = Depends(get_db
     return {
         "hasKeys": True,
         "binanceApiKeyPreview": preview,
-        "binanceTestnet": bool(paper),
+        "binanceTestnet": exchange_testnet_flag(env),
+        "binanceEnv": env,
         "credentialSource": "env",
     }
 
@@ -76,8 +78,9 @@ async def save_credentials(
         row.testnet = body.binanceTestnet
         row.updated_at = now
     await db.commit()
-    futures_account_sync.reset_sync_dedupe()
-    await futures_account_sync.sync_futures_account_to_hub_once()
+    await reset_pool_after_credentials_change()
+    spot_account_sync.reset_sync_dedupe()
+    await spot_account_sync.sync_spot_account_to_hub_once(bot_id)
     _log.info("credentials updated bot_id=%s testnet=%s", bot_id, body.binanceTestnet)
     return {
         "ok": True,
@@ -92,5 +95,6 @@ async def save_credentials(
 async def delete_credentials(bot_id: str, db: AsyncSession = Depends(get_db_session)) -> dict:
     await db.execute(delete(ExchangeCredential).where(ExchangeCredential.bot_id == bot_id))
     await db.commit()
-    futures_account_sync.reset_sync_dedupe()
+    await reset_pool_after_credentials_change()
+    spot_account_sync.reset_sync_dedupe()
     return {"ok": True, "hasKeys": False, "credentialSource": "none"}

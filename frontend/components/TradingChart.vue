@@ -6,8 +6,10 @@ import {
   ColorType,
 } from "lightweight-charts"
 import type {
+  AutoscaleInfo,
   IChartApi,
   ISeriesApi,
+  LogicalRangeChangeEventHandler,
   UTCTimestamp,
   CandlestickData,
   Time,
@@ -22,7 +24,9 @@ const klinesError = ref<string | null>(null)
 const isLoading = ref(true)
 
 /** Must match ``interval`` query to ``/klines`` (seconds per bar). */
-const KLINES_INTERVAL_SEC = 5 * 60
+const KLINES_INTERVAL = "15m"
+const KLINES_INTERVAL_SEC = 15 * 60
+const KLINES_LIMIT = 300
 /** In-memory series copy for live OHLC updates from mark WebSocket. */
 let syncedCandles: CandlestickData<Time>[] = []
 
@@ -32,8 +36,12 @@ let lineSeries: ISeriesApi<"Line"> | null = null
 /** Series that owns generator / grid price lines */
 let priceLineHost: ISeriesApi<"Candlestick"> | ISeriesApi<"Line"> | null = null
 const priceLines = shallowRef<object[]>([])
-let resizeObserver: ResizeObserver | null = null
 let klinesRetryTimer: ReturnType<typeof setTimeout> | null = null
+/** User panned/zoomed — do not reset scale on live mark ticks. */
+let viewportLockedByUser = false
+let suppressViewportLock = false
+let onVisibleLogicalRangeChange: LogicalRangeChangeEventHandler | null = null
+let onChartWheel: (() => void) | null = null
 
 const MARK_LINE_SERIES_OPTS = {
   color: "#38bdf8",
@@ -55,6 +63,34 @@ const CANDLE_SERIES_OPTS = {
   lastValueVisible: true,
   priceScaleId: "right",
 } as const
+
+/** OHLC + mark only — grid price lines must not squash the candle viewport. */
+function tradePriceAutoscaleInfo(): AutoscaleInfo | null {
+  let min = Number.POSITIVE_INFINITY
+  let max = Number.NEGATIVE_INFINITY
+  for (const c of syncedCandles) {
+    min = Math.min(min, c.low as number)
+    max = Math.max(max, c.high as number)
+  }
+  const mp = store.markPrice
+  if (mp > 0) {
+    min = Math.min(min, mp)
+    max = Math.max(max, mp)
+  }
+  if (!Number.isFinite(min) || !Number.isFinite(max)) return null
+  if (min === max) {
+    const eps = Math.max(min * 0.01, 1e-8)
+    min -= eps
+    max += eps
+  }
+  const pad = Math.max((max - min) * 0.1, max * 0.002)
+  return {
+    priceRange: { minValue: min - pad, maxValue: max + pad },
+    margins: { above: 14, below: 14 },
+  }
+}
+
+const AUTOSCALE_FROM_CANDLES = () => tradePriceAutoscaleInfo()
 
 function seriesForPriceLines() {
   return priceLineHost
@@ -116,16 +152,82 @@ function rebuildPriceLines() {
   priceLines.value = next
 }
 
-function normalizeLinePoints(data: { time: number; value: number }[]) {
-  if (data.length === 0) return []
-  if (data.length === 1) {
-    const p = data[0]
+function bindViewportLockHandlers() {
+  if (!chart) return
+  if (onVisibleLogicalRangeChange) {
+    chart.timeScale().unsubscribeVisibleLogicalRangeChange(onVisibleLogicalRangeChange)
+  }
+  onVisibleLogicalRangeChange = () => {
+    if (suppressViewportLock || viewportLockedByUser) return
+    viewportLockedByUser = true
+    chart?.applyOptions({ rightPriceScale: { autoScale: false } })
+  }
+  chart.timeScale().subscribeVisibleLogicalRangeChange(onVisibleLogicalRangeChange)
+  const el = root.value
+  if (el) {
+    onChartWheel = () => {
+      if (suppressViewportLock) return
+      viewportLockedByUser = true
+      chart?.applyOptions({ rightPriceScale: { autoScale: false } })
+    }
+    el.addEventListener("wheel", onChartWheel, { passive: true })
+  }
+}
+
+function unbindViewportLockHandlers() {
+  if (chart && onVisibleLogicalRangeChange) {
+    chart.timeScale().unsubscribeVisibleLogicalRangeChange(onVisibleLogicalRangeChange)
+    onVisibleLogicalRangeChange = null
+  }
+  const el = root.value
+  if (el && onChartWheel) {
+    el.removeEventListener("wheel", onChartWheel)
+    onChartWheel = null
+  }
+}
+
+function applyDefaultViewport() {
+  if (!chart) return
+  suppressViewportLock = true
+  try {
+    chart.timeScale().fitContent()
+    chart.timeScale().scrollToRealTime()
+  } finally {
+    suppressViewportLock = false
+  }
+}
+
+function resetChartViewport() {
+  if (!chart) return
+  viewportLockedByUser = false
+  chart.applyOptions({ rightPriceScale: { autoScale: true } })
+  applyDefaultViewport()
+}
+
+/** Align mark ticks to candle buckets so the time scale matches OHLC bars. */
+function bucketMarkSeries(data: { time: number; value: number }[]) {
+  const byBucket = new Map<number, number>()
+  for (const p of data) {
+    if (!(p.value > 0)) continue
+    const b = bucketStart(Math.floor(p.time))
+    byBucket.set(b, p.value)
+  }
+  const mark = store.markPrice
+  if (mark > 0) {
+    byBucket.set(bucketStart(Math.floor(Date.now() / 1000)), mark)
+  }
+  const pts = [...byBucket.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([time, value]) => ({ time: time as UTCTimestamp, value }))
+  if (pts.length === 0) return []
+  if (pts.length === 1) {
+    const p = pts[0]
     return [
-      { time: p.time as UTCTimestamp, value: p.value },
-      { time: (p.time + 1) as UTCTimestamp, value: p.value },
+      { time: p.time, value: p.value },
+      { time: (p.time + KLINES_INTERVAL_SEC) as UTCTimestamp, value: p.value },
     ]
   }
-  return data.map((x) => ({ time: x.time as UTCTimestamp, value: x.value }))
+  return pts
 }
 
 function parseKlinesPayload(rows: unknown): CandlestickData<Time>[] {
@@ -191,20 +293,18 @@ function parseKlinesPayload(rows: unknown): CandlestickData<Time>[] {
 
 function applyMarkData() {
   if (!lineSeries) return
-  const d = store.markSeriesData
-  const pts = normalizeLinePoints(d)
+  const pts = bucketMarkSeries(store.markSeriesData)
   if (pts.length === 0) {
-    const t = Math.floor(Date.now() / 1000) as UTCTimestamp
+    const bucket = bucketStart(Math.floor(Date.now() / 1000)) as UTCTimestamp
     const v =
       store.markPrice > 0 ? store.markPrice : Math.max(store.generatorLower || 0, 1e-8) || 1
     lineSeries.setData([
-      { time: t, value: v },
-      { time: (t + 1) as UTCTimestamp, value: v },
+      { time: bucket, value: v },
+      { time: (bucket + KLINES_INTERVAL_SEC) as UTCTimestamp, value: v },
     ])
     return
   }
   lineSeries.setData(pts)
-  chart?.timeScale().scrollToRealTime()
 }
 
 function klinesUrl(botId: string, base: string): string {
@@ -212,7 +312,7 @@ function klinesUrl(botId: string, base: string): string {
   return `${prefix}/api/bots/${encodeURIComponent(botId)}/klines`
 }
 
-/** Normalized perpetual symbol for klines (backend rejects missing symbol). */
+/** Normalized Spot symbol for klines (backend rejects missing symbol). */
 function resolveKlinesSymbol(): string {
   const s = String(store.symbol ?? "")
     .trim()
@@ -236,8 +336,8 @@ async function loadKlines(): Promise<CandlestickData<Time>[]> {
     const rows = await $fetch<unknown>(klinesUrl(botId, base), {
       query: {
         symbol,
-        interval: "5m",
-        limit: 200,
+        interval: KLINES_INTERVAL,
+        limit: KLINES_LIMIT,
       },
     })
     return parseKlinesPayload(rows)
@@ -306,13 +406,18 @@ function ensureCandleSeries(candles: CandlestickData<Time>[]) {
   if (!chart) return
   try {
     if (!candleSeries) {
-      candleSeries = chart.addSeries(CandlestickSeries, { ...CANDLE_SERIES_OPTS })
+      candleSeries = chart.addSeries(CandlestickSeries, {
+        ...CANDLE_SERIES_OPTS,
+        autoscaleInfoProvider: AUTOSCALE_FROM_CANDLES,
+      })
       priceLineHost = candleSeries
     }
     const data = candles.length ? candles : []
     candleSeries.setData(data)
     syncedCandles = data.map((c) => ({ ...c }))
-    if (candles.length > 0) chart.timeScale().fitContent()
+    if (candles.length > 0 && !viewportLockedByUser) {
+      applyDefaultViewport()
+    }
     updateLiveCandleFromMark(store.markPrice)
   } catch (e) {
     klinesError.value = `lightweight-charts: ${String(e)}`
@@ -346,15 +451,40 @@ onMounted(async () => {
       vertLines: { color: "rgba(30,38,48,0.6)" },
       horzLines: { color: "rgba(30,38,48,0.6)" },
     },
-    rightPriceScale: { borderColor: "#1e2630" },
-    timeScale: { borderColor: "#1e2630" },
+    rightPriceScale: {
+      borderColor: "#1e2630",
+      autoScale: true,
+      scaleMargins: { top: 0.08, bottom: 0.08 },
+    },
+    timeScale: {
+      borderColor: "#1e2630",
+      timeVisible: true,
+      secondsVisible: false,
+      rightOffset: 8,
+    },
+    handleScroll: {
+      mouseWheel: true,
+      pressedMouseMove: true,
+      horzTouchDrag: true,
+      vertTouchDrag: false,
+    },
+    handleScale: {
+      mouseWheel: true,
+      pinch: true,
+      axisPressedMouseMove: { time: true, price: true },
+      axisDoubleClickReset: { time: true, price: true },
+    },
     crosshair: { mode: 1 },
   })
 
   // Do not call ``applyOptions({ width })`` while ``autoSize: true`` — lightweight-charts throws.
   ensureCandleSeries(candles)
 
-  lineSeries = chart.addSeries(LineSeries, { ...MARK_LINE_SERIES_OPTS })
+  lineSeries = chart.addSeries(LineSeries, {
+    ...MARK_LINE_SERIES_OPTS,
+    autoscaleInfoProvider: AUTOSCALE_FROM_CANDLES,
+  })
+  bindViewportLockHandlers()
   rebuildPriceLinesAfterSeriesReady()
   applyMarkData()
 
@@ -368,11 +498,6 @@ onMounted(async () => {
     }, 900)
   }
 
-  resizeObserver = new ResizeObserver(() => {
-    if (!chart || !root.value) return
-    requestAnimationFrame(() => chart?.timeScale().fitContent())
-  })
-  resizeObserver.observe(root.value)
 })
 
 watch(
@@ -408,10 +533,14 @@ watch(
   () => store.symbol,
   async () => {
     if (!chart || !candleSeries) return
+    store.clearMarkSeries()
     syncedCandles = []
+    viewportLockedByUser = false
+    chart.applyOptions({ rightPriceScale: { autoScale: true } })
     const candles = await loadKlines()
     ensureCandleSeries(candles)
     rebuildPriceLinesAfterSeriesReady()
+    applyMarkData()
   },
 )
 
@@ -421,11 +550,11 @@ onBeforeUnmount(() => {
     clearTimeout(klinesRetryTimer)
     klinesRetryTimer = null
   }
-  resizeObserver?.disconnect()
-  resizeObserver = null
+  unbindViewportLockHandlers()
   clearPriceLines()
   chart?.remove()
   chart = null
+  viewportLockedByUser = false
   candleSeries = null
   lineSeries = null
   priceLineHost = null
@@ -435,6 +564,12 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="chart-wrap-inner">
+    <div class="chart-toolbar">
+      <button type="button" class="chart-reset-btn" @click="resetChartViewport">
+        إعادة ضبط التكبير
+      </button>
+      <span class="chart-hint muted">عجلة الفأرة: تكبير · سحب: تحريك · محور السعر: سحب عمودي</span>
+    </div>
     <p v-if="klinesError" class="klines-err" role="status">{{ klinesError }}</p>
     <div class="chart-stage">
       <div v-if="isLoading" class="chart-loading" aria-live="polite">جاري تحميل الشموع…</div>
@@ -448,16 +583,43 @@ onBeforeUnmount(() => {
   width: 100%;
   min-height: 420px;
 }
+.chart-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.5rem;
+}
+.chart-reset-btn {
+  cursor: pointer;
+  border: 1px solid var(--border, #1e2630);
+  border-radius: 6px;
+  padding: 0.35rem 0.65rem;
+  font-size: 0.78rem;
+  font-weight: 600;
+  background: #0f1318;
+  color: #e2e8f0;
+}
+.chart-reset-btn:hover {
+  border-color: #38bdf8;
+  color: #38bdf8;
+}
+.chart-hint {
+  font-size: 0.72rem;
+}
 .chart-stage {
   position: relative;
   width: 100%;
   min-height: 400px;
+  touch-action: none;
+  overscroll-behavior: contain;
 }
 .chart-root {
   width: 100%;
   min-width: 200px;
   min-height: 400px;
   height: 420px;
+  touch-action: none;
 }
 .chart-loading {
   position: absolute;
