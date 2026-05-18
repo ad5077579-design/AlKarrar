@@ -7,6 +7,8 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+pytestmark = pytest.mark.financial
+
 from backend.api.grid_snapshot_store import (
     disable_stale_resume_snapshots,
     snapshot_matches_credentials,

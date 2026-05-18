@@ -79,9 +79,6 @@ onBeforeUnmount(() => {
       </button>
     </div>
     <p class="sidebar-hint muted">Spot · USDT · {{ store.spotEnvLabelAr }}</p>
-    <p v-if="store.excludedStableSymbols.length" class="sidebar-excluded muted">
-      مستبعدة (مستقرة): {{ store.excludedStableSymbols.join("، ") }}
-    </p>
 
     <input
       v-model="query"
@@ -209,12 +206,6 @@ onBeforeUnmount(() => {
 .sidebar-hint {
   margin: 0;
   font-size: 0.72rem;
-}
-.sidebar-excluded {
-  margin: 0.2rem 0 0;
-  font-size: 0.65rem;
-  line-height: 1.35;
-  color: #6b7280;
 }
 .search {
   margin-top: 0.15rem;

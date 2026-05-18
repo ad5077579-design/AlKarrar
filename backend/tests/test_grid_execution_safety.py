@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import pytest
 
+pytestmark = pytest.mark.financial
+
 from backend.main_engine import Side
 from backend.strategies.alkarrar_pro_shifting_grid import (
     AlKarrarProShiftingGridStrategy,

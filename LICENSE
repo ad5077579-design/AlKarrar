@@ -1,28 +1,58 @@
-MIT License
+AlKarrar Community License 1.0
 
 Copyright (c) 2026 AlKarrar Contributors
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+This software and documentation ("Software") are a community project for traders
+and developers. The Software is not a commercial product for sale or lease.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+================================================================================
+COMMUNITY OWNERSHIP
+================================================================================
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+AlKarrar Pro belongs to the community: every trader and programmer may use,
+study, improve, and share it. No person or entity may claim exclusive ownership
+of the core project or remove its open, community character.
 
----
+================================================================================
+PERMITTED USE
+================================================================================
 
-DISCLAIMER: This software is for research and educational purposes. Cryptocurrency
-trading involves substantial risk of loss. The authors and contributors are not
-responsible for any financial losses incurred through use of this software.
-Always test on Binance Spot Demo or testnet before using real funds.
+You MAY, for any purpose including personal trading (at your own risk):
+
+  - Use, copy, and run the Software
+  - Modify and create derivative works
+  - Distribute source and binaries under this same license
+  - Contribute improvements via pull requests and public forks
+
+================================================================================
+PROHIBITED USE
+================================================================================
+
+You MAY NOT:
+
+  - Sell the Software, a fork, or a derivative as a standalone product
+  - Rent, lease, or sublicense the Software for a fee
+  - Offer paid access to the Software as a closed hosted service (SaaS) without
+    providing corresponding source under this license to your users
+  - Remove or replace this license on distributed copies
+  - Imply endorsement by the AlKarrar Contributors without permission
+
+Offering consulting, support, or custom integrations is allowed only if it does
+not transfer proprietary rights in the core Software and does not violate the
+prohibitions above.
+
+================================================================================
+DISCLAIMER
+================================================================================
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND. CRYPTOCURRENCY
+TRADING INVOLVES SUBSTANTIAL RISK OF LOSS. CONTRIBUTORS ARE NOT LIABLE FOR ANY
+FINANCIAL LOSSES. TEST ON BINANCE SPOT DEMO OR TESTNET BEFORE MAINNET.
+
+================================================================================
+ARABIC SUMMARY (informative, not a separate legal text)
+================================================================================
+
+هذا المشروع مفتوح المصدر وملك للمجتمع: لكل متداول ومبرمج الحق في الاستخدام
+والتطوير والمشاركة. لا يجوز بيع المشروع أو استئجاره أو تأجيره كمنتج تجاري،
+ولا يجوز حجب الشفرة المصدرية عند تقديمه كخدمة مدفوعة للغير.

@@ -337,7 +337,7 @@ async function loadKlines(): Promise<CandlestickData<Time>[]> {
     const botId = String(cfg.public.botId)
     const raw = cfg.public.apiBase
     const base = raw == null || raw === "" ? "" : String(raw).replace(/\/$/, "")
-    const rows = await $fetch<unknown>(klinesUrl(botId, base), {
+    const rows = await apiFetch<unknown>(klinesUrl(botId, base), {
       query: {
         symbol,
         interval: KLINES_INTERVAL,

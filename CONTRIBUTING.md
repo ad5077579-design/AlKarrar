@@ -2,6 +2,8 @@
 
 Thank you for helping improve an open-source Spot grid engine. This project handles **real money** on mainnet — we review changes carefully, especially around execution, risk, and credentials.
 
+**Community ownership:** By contributing, you agree that improvements remain under the [AlKarrar Community License](LICENSE). The project is for all traders and programmers — **do not sell or rent/lease the software** as a commercial product. See [docs/COMMUNITY.md](docs/COMMUNITY.md).
+
 Repository: [github.com/ad5077579-design/AlKarrar](https://github.com/ad5077579-design/AlKarrar)
 
 ---
@@ -10,12 +12,15 @@ Repository: [github.com/ad5077579-design/AlKarrar](https://github.com/ad5077579-
 
 1. Read [README.md](README.md), [ARCHITECTURE.md](ARCHITECTURE.md), and [docs/TRADE_LOGIC.md](docs/TRADE_LOGIC.md).
 2. Test on **Binance Spot Demo** or **testnet** — never commit API keys.
-3. Run the test suite locally:
+3. Run the test suite locally (same as [GitHub Actions CI](docs/CI.md)):
 
 ```bash
 pip install -r requirements.txt
+python -m pytest backend/tests -m financial -q
 python -m pytest backend/tests -q
 ```
+
+Pull requests must pass **Backend tests (pytest)** before merge — see [docs/CI.md](docs/CI.md) to enable branch protection on `main`.
 
 4. For env/key changes:
 
@@ -105,7 +110,8 @@ Display-only: `exchangeTestnet`. Breaking these breaks the Nuxt client and saved
 ### Tests
 
 - Put tests under `backend/tests/test_*.py`.
-- Mock exchange calls; no live keys in CI (future GitHub Actions should use mocks only).
+- Mock exchange calls; no live keys in CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml), isolated temp DB via `conftest.py`).
+- Tag execution / resume / risk tests with `@pytest.mark.financial` so they run in the guard step.
 
 ---
 

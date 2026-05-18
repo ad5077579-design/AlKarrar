@@ -11,6 +11,7 @@ from backend.api import mark_feed, spot_account_sync, spot_user_stream
 from backend.api.grid_recovery import reconcile_snapshots_for_current_credentials, resume_grids_after_startup
 from backend.api.maintenance_tasks import run_maintenance_loop, run_maintenance_once
 from backend.api.bot_hub import hub
+from backend.api.middleware.dashboard_auth import DashboardAuthMiddleware
 from backend.api.routers import api_router, dashboard
 from backend.api.ws_endpoint import websocket_dashboard
 from backend.database import async_session_factory, init_db
@@ -111,6 +112,7 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     app = FastAPI(title="AlKarrar Pro API", lifespan=lifespan)
+    app.add_middleware(DashboardAuthMiddleware)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[

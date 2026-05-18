@@ -44,11 +44,27 @@ python scripts/probe_binance_env.py --no-cache
 
 ---
 
+## Dashboard authentication
+
+Set **`ALKARRAR_DASHBOARD_PASSWORD`** in `.env` on the server (never in the browser). The Nuxt UI shows `/login`; the API issues an **HttpOnly** session cookie. Binance keys stay server-side.
+
+| Variable | Role |
+|----------|------|
+| `ALKARRAR_DASHBOARD_PASSWORD` | Enables auth when non-empty |
+| `ALKARRAR_DASHBOARD_USERNAME` | Default `admin` |
+| `ALKARRAR_AUTH_SECRET` | Signs cookies (defaults to password — set a long random value in production) |
+| `ALKARRAR_AUTH_COOKIE_SECURE=true` | Required when serving over HTTPS |
+
+This is **single-operator** protection (not multi-user SaaS). For internet exposure, also use a reverse proxy (TLS, IP allowlist, VPN).
+
+---
+
 ## Known limitations
 
 - CORS allows localhost origins in dev — tighten for production deployments.
 - SQLite files are local — protect server filesystem permissions.
 - User stream may be unavailable on demo; balance relies on REST polling.
+- Dashboard auth does not replace securing the host OS and firewall.
 
 ---
 

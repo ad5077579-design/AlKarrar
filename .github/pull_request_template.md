@@ -20,7 +20,7 @@
 
 ## Checklist
 
-- [ ] `python -m pytest backend/tests -q` passes
+- [ ] CI **Backend tests (pytest)** is green (or locally: `python -m pytest backend/tests -q`)
 - [ ] No API keys or `.env` in the diff
 - [ ] Contract fields unchanged (`generatorUpper`, `allocatedCapital`, …)
 - [ ] `.env.example` updated if new env vars

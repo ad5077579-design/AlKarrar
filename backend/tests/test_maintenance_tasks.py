@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from datetime import datetime, timedelta, timezone
 
+import pytest
 from sqlalchemy import select
+
+pytestmark = pytest.mark.financial
 
 from backend.api.maintenance_tasks import purge_old_audit_logs, purge_old_trade_fills
 from backend.database import async_session_factory
@@ -15,9 +19,11 @@ from backend.database.models.trade_fill import TradeFill
 
 def test_purge_old_audit_and_fills() -> None:
     async def _run() -> None:
-        bid = "test_maint_purge_only"
+        bid = f"test_maint_purge_{uuid.uuid4().hex[:12]}"
         old = datetime.now(timezone.utc) - timedelta(days=40)
         recent = datetime.now(timezone.utc) - timedelta(days=1)
+        tid_old = f"maint-old-{uuid.uuid4().hex}"
+        tid_recent = f"maint-recent-{uuid.uuid4().hex}"
         async with async_session_factory() as session:
             session.add(
                 BotAuditLog(
@@ -44,7 +50,7 @@ def test_purge_old_audit_and_fills() -> None:
             session.add(
                 TradeFill(
                     bot_id=bid,
-                    exchange_trade_id="9001",
+                    exchange_trade_id=tid_old,
                     order_id="1",
                     symbol="DOGEUSDT",
                     side="BUY",
@@ -57,7 +63,7 @@ def test_purge_old_audit_and_fills() -> None:
             session.add(
                 TradeFill(
                     bot_id=bid,
-                    exchange_trade_id="9002",
+                    exchange_trade_id=tid_recent,
                     order_id="2",
                     symbol="DOGEUSDT",
                     side="BUY",

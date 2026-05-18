@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import pytest
 
+pytestmark = pytest.mark.financial
+
 from backend.api.spot_realized_ledger import SpotGridRealizedLedger
 from backend.main_engine import Side
 from backend.strategies.alkarrar_pro_shifting_grid import (

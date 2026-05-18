@@ -5,6 +5,10 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import pytest
+
+pytestmark = pytest.mark.financial
+
 from backend.api.grid_snapshot_store import (
     build_grid_settings_from_snapshot,
     list_resumable_snapshots,

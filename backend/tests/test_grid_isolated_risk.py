@@ -6,6 +6,8 @@ import asyncio
 
 import pytest
 
+pytestmark = pytest.mark.financial
+
 from backend.api.portfolio_risk import (
     clear_grid_risk_slot,
     maybe_trailing_equity_stop_for_grid,

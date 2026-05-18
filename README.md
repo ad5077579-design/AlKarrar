@@ -4,6 +4,8 @@
 
 Official repository: [github.com/ad5077579-design/AlKarrar](https://github.com/ad5077579-design/AlKarrar)
 
+[![CI](https://github.com/ad5077579-design/AlKarrar/actions/workflows/ci.yml/badge.svg)](https://github.com/ad5077579-design/AlKarrar/actions/workflows/ci.yml)
+
 ### How the strategy works (at a glance)
 
 ```mermaid
@@ -35,6 +37,9 @@ flowchart TB
 More diagrams: [docs/STRATEGY_DIAGRAMS.md](docs/STRATEGY_DIAGRAMS.md) · **Custom strategies welcome:** [docs/PLUGINS.md](docs/PLUGINS.md)
 
 > **Risk disclaimer:** Trading cryptocurrencies carries significant risk. This software does not provide financial advice. Test thoroughly on [Binance Spot Demo](https://demo.binance.com) or [testnet](https://testnet.binance.vision) before mainnet. You are solely responsible for your API keys and capital.
+
+> **Community license:** AlKarrar Pro is **open source and community-owned** — for every trader and developer. **You may not sell or rent/lease the project** as a commercial product. Use, fork, and contribute freely under [LICENSE](LICENSE) · [docs/COMMUNITY.md](docs/COMMUNITY.md)  
+> **الترخيص:** المشروع **ملك للمجتمع** (كل متداول ومبرمج). **لا يجوز بيعه ولا استئجاره أو تأجيره** كمنتج تجاري؛ الاستخدام والتطوير والمشاركة مسموحان وفق [LICENSE](LICENSE).
 
 ---
 
@@ -120,8 +125,11 @@ Open **http://127.0.0.1:3000** — API and WebSocket are proxied via Nuxt in dev
 ### 4. Run tests
 
 ```bash
-python -m pytest backend/tests -q
+python -m pytest backend/tests -m financial -q   # execution / resume / risk guards
+python -m pytest backend/tests -q               # full suite
 ```
+
+CI runs the same on every pull request — see [docs/CI.md](docs/CI.md).
 
 ---
 
@@ -133,8 +141,11 @@ python -m pytest backend/tests -q
 | [docs/TRADE_LOGIC.md](docs/TRADE_LOGIC.md) | **Why** the strategy works this way (whitepaper) |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Pull requests, safety rules |
 | [SECURITY.md](SECURITY.md) | Secrets and vulnerability reporting |
+| [docs/AUTH.md](docs/AUTH.md) | Dashboard login (`ALKARRAR_DASHBOARD_PASSWORD`) |
+| [docs/COMMUNITY.md](docs/COMMUNITY.md) | Community ownership — no sale or lease |
 | [AGENTS.md](AGENTS.md) | Maintainer / AI agent operational reference |
 | [.env.example](.env.example) | All environment variables |
+| [docs/CI.md](docs/CI.md) | GitHub Actions + branch protection |
 
 ---
 

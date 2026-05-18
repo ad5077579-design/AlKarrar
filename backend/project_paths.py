@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 
@@ -11,6 +12,7 @@ def project_root() -> Path:
 
 
 def data_dir() -> Path:
-    p = project_root() / "data"
+    override = (os.environ.get("ALKARRAR_DATA_DIR") or "").strip()
+    p = Path(override) if override else project_root() / "data"
     p.mkdir(parents=True, exist_ok=True)
     return p

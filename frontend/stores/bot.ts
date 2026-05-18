@@ -821,7 +821,7 @@ export const useBotStore = defineStore("bot", () => {
     const cfg = useRuntimeConfig()
     const botId = String(cfg.public.botId)
     try {
-      const data = await $fetch<Record<string, unknown>>(
+      const data = await apiFetch<Record<string, unknown>>(
         `${publicApiPrefix()}/api/bots/${botId}/dashboard`,
         { timeout: 12_000 },
       )
@@ -845,7 +845,7 @@ export const useBotStore = defineStore("bot", () => {
   async function fetchCredentials() {
     const cfg = useRuntimeConfig()
     const botId = String(cfg.public.botId)
-    const data = await $fetch<{
+    const data = await apiFetch<{
       hasKeys: boolean
       binanceApiKeyPreview: string
       binanceTestnet: boolean
@@ -870,7 +870,7 @@ export const useBotStore = defineStore("bot", () => {
   }) {
     const cfg = useRuntimeConfig()
     const botId = String(cfg.public.botId)
-    const res = await $fetch<{
+    const res = await apiFetch<{
       ok: boolean
       hasKeys: boolean
       binanceApiKeyPreview: string
@@ -893,7 +893,7 @@ export const useBotStore = defineStore("bot", () => {
   async function clearCredentials() {
     const cfg = useRuntimeConfig()
     const botId = String(cfg.public.botId)
-    await $fetch(`${publicApiPrefix()}/api/bots/${botId}/credentials`, { method: "DELETE" })
+    await apiFetch(`${publicApiPrefix()}/api/bots/${botId}/credentials`, { method: "DELETE" })
     credentialsConfigured.value = false
     credentialsLocked = false
     binanceApiKeyPreview.value = ""
@@ -908,7 +908,7 @@ export const useBotStore = defineStore("bot", () => {
   }) {
     const cfg = useRuntimeConfig()
     const botId = String(cfg.public.botId)
-    const merged = await $fetch<Record<string, unknown>>(
+    const merged = await apiFetch<Record<string, unknown>>(
       `${publicApiPrefix()}/api/bots/${botId}/settings`,
       { method: "PATCH", body: payload },
     )
@@ -918,7 +918,7 @@ export const useBotStore = defineStore("bot", () => {
   async function setAutoCompounding(enabled: boolean) {
     const cfg = useRuntimeConfig()
     const botId = String(cfg.public.botId)
-    const merged = await $fetch<Record<string, unknown>>(
+    const merged = await apiFetch<Record<string, unknown>>(
       `${publicApiPrefix()}/api/bots/${botId}/settings`,
       {
         method: "PATCH",
@@ -948,7 +948,7 @@ export const useBotStore = defineStore("bot", () => {
     marketsLoading.value = true
     marketsError.value = null
     try {
-      const data = await $fetch<{
+      const data = await apiFetch<{
         quote: string
         exchangeTestnet: boolean
         updatedAt: string
@@ -986,7 +986,7 @@ export const useBotStore = defineStore("bot", () => {
     const cfg = useRuntimeConfig()
     const botId = String(cfg.public.botId)
     try {
-      const merged = await $fetch<Record<string, unknown>>(
+      const merged = await apiFetch<Record<string, unknown>>(
         `${publicApiPrefix()}/api/bots/${botId}/settings`,
         { method: "PATCH", body: { symbol: normalized } },
       )
@@ -1053,7 +1053,7 @@ export const useBotStore = defineStore("bot", () => {
     const cfg = useRuntimeConfig()
     const botId = String(cfg.public.botId)
     const normalized = sym.trim().toUpperCase().replace("/", "")
-    const data = await $fetch<{
+    const data = await apiFetch<{
       symbol?: string
       frozen?: boolean
       freezeReason?: string
@@ -1083,7 +1083,7 @@ export const useBotStore = defineStore("bot", () => {
     const cfg = useRuntimeConfig()
     const botId = String(cfg.public.botId)
     const normalized = sym.trim().toUpperCase().replace("/", "")
-    await $fetch(`${publicApiPrefix()}/api/bots/${botId}/grid/ledger/clear`, {
+    await apiFetch(`${publicApiPrefix()}/api/bots/${botId}/grid/ledger/clear`, {
       method: "POST",
       query: { symbol: normalized },
     })
@@ -1103,7 +1103,7 @@ export const useBotStore = defineStore("bot", () => {
     try {
       const cfg = useRuntimeConfig()
       const botId = String(cfg.public.botId)
-      const data = await $fetch<{
+      const data = await apiFetch<{
         symbol: string
         source: string
         syncError: string | null
@@ -1164,7 +1164,7 @@ export const useBotStore = defineStore("bot", () => {
     if (!opts?.quiet) tradesLoading.value = true
     tradesError.value = null
     try {
-      const data = await $fetch<{
+      const data = await apiFetch<{
         symbol: string
         source: string
         syncError: string | null
@@ -1200,7 +1200,7 @@ export const useBotStore = defineStore("bot", () => {
     const cfg = useRuntimeConfig()
     const botId = String(cfg.public.botId)
     try {
-      const data = await $fetch<{
+      const data = await apiFetch<{
         running?: boolean
         symbol?: string
         startedAt?: string
@@ -1303,7 +1303,7 @@ export const useBotStore = defineStore("bot", () => {
       body.initialCapital = alloc
     }
 
-    const res = await $fetch<Record<string, unknown>>(
+    const res = await apiFetch<Record<string, unknown>>(
       `${publicApiPrefix()}/api/bots/${botId}/grid/start`,
       {
         method: "POST",
@@ -1325,7 +1325,7 @@ export const useBotStore = defineStore("bot", () => {
     const botId = String(cfg.public.botId)
     const sym = symbol?.trim().toUpperCase().replace("/", "") || ""
     const body = sym ? { symbol: sym } : {}
-    await $fetch(`${publicApiPrefix()}/api/bots/${botId}/grid/stop`, {
+    await apiFetch(`${publicApiPrefix()}/api/bots/${botId}/grid/stop`, {
       method: "POST",
       body,
     })
@@ -1339,7 +1339,7 @@ export const useBotStore = defineStore("bot", () => {
   async function emergencyStop() {
     const cfg = useRuntimeConfig()
     const botId = String(cfg.public.botId)
-    await $fetch(`${publicApiPrefix()}/api/emergency_stop`, {
+    await apiFetch(`${publicApiPrefix()}/api/emergency_stop`, {
       method: "POST",
       body: { bot_id: botId },
     })
@@ -1357,7 +1357,7 @@ export const useBotStore = defineStore("bot", () => {
   async function fetchAuditLogs(limit = 200): Promise<AuditLogRow[]> {
     const cfg = useRuntimeConfig()
     const botId = String(cfg.public.botId)
-    const data = await $fetch<{ logs?: AuditLogRow[] }>(
+    const data = await apiFetch<{ logs?: AuditLogRow[] }>(
       `${publicApiPrefix()}/api/bots/${botId}/audit`,
       {
         query: { limit },
