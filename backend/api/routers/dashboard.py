@@ -81,6 +81,7 @@ class GridStartBody(BaseModel):
     generatorCount: int | None = None
     maxGeneratorCount: int | None = None
     initialCapital: float | None = None
+    allocatedCapital: float | None = None
     levels: int = 8
     trailingOffset: float | None = None
     trailing_stop_pct: float | None = None
@@ -99,12 +100,14 @@ class DashboardSettingsPatch(BaseModel):
     generatorCount: int | None = None
     maxGeneratorCount: int | None = None
     initialCapital: float | None = None
+    allocatedCapital: float | None = None
     trailingOffset: float | None = None
     trailing_stop_pct: float | None = None
     compoundingFactor: float | None = None
     profit_injection_mode: str | None = None
     max_slippage_pct: float | None = None
     dca_mode: str | None = None
+    autoCompoundingEnabled: bool | None = None
 
     @model_validator(mode="after")
     def _validate(self) -> DashboardSettingsPatch:
@@ -117,19 +120,15 @@ class DashboardSettingsPatch(BaseModel):
             raise ValueError("generatorCount must be >= 2")
         if self.maxGeneratorCount is not None and self.maxGeneratorCount < 2:
             raise ValueError("maxGeneratorCount must be >= 2")
-        if (
-            self.generatorCount is not None
-            and self.maxGeneratorCount is not None
-            and self.maxGeneratorCount <= self.generatorCount
-        ):
-            raise ValueError("maxGeneratorCount must be greater than generatorCount for hybrid expansion")
         if self.initialCapital is not None and self.initialCapital <= 0:
             raise ValueError("initialCapital must be > 0")
+        if self.allocatedCapital is not None and self.allocatedCapital <= 0:
+            raise ValueError("allocatedCapital must be > 0")
         if self.profit_injection_mode is not None:
             m = self.profit_injection_mode.strip().lower()
-            if m not in ("expand_count", "compound_size"):
-                raise ValueError("profit_injection_mode must be expand_count or compound_size")
-            self.profit_injection_mode = m
+            if m != "compound_size":
+                raise ValueError("profit_injection_mode must be compound_size (expand_count is disabled)")
+            self.profit_injection_mode = "compound_size"
         if self.dca_mode is not None:
             d = self.dca_mode.strip().lower()
             if d not in ("equal", "log"):
@@ -158,10 +157,9 @@ def _merge_advanced_grid_settings(
         return default
 
     settings["trailingOffset"] = float(pick("trailingOffset", max(upper * 0.002, 1e-6)))
-    settings["compoundingFactor"] = float(pick("compoundingFactor", 0.05))
+    settings["compoundingFactor"] = float(pick("compoundingFactor", 1.0))
     settings["trailing_stop_pct"] = float(pick("trailing_stop_pct", 0.01))
-    mode = str(pick("profit_injection_mode", "expand_count")).lower()
-    settings["profit_injection_mode"] = "compound_size" if mode == "compound_size" else "expand_count"
+    settings["profit_injection_mode"] = "compound_size"
     dca = str(pick("dca_mode", "equal")).lower()
     settings["dca_mode"] = "log" if dca == "log" else "equal"
     slip = pick("max_slippage_pct", None)
@@ -375,6 +373,37 @@ async def grid_status(bot_id: str) -> dict[str, Any]:
     return {"bot_id": bot_id, "activeSymbols": active, "count": len(active), "grids": grids}
 
 
+@router.get("/{bot_id}/grid/ledger")
+async def grid_ledger_snapshot(
+    bot_id: str,
+    symbol: str = Query(..., description="Spot symbol e.g. DOGEUSDT"),
+) -> dict[str, Any]:
+    """In-memory grid audit ledger (not persisted to SQLite)."""
+    from backend.api.grid_live_ledger import grid_live_ledger
+
+    sym = symbol.strip().upper().replace("/", "")
+    snap = grid_live_ledger.snapshot(sym)
+    snap["bot_id"] = bot_id
+    return snap
+
+
+@router.post("/{bot_id}/grid/ledger/clear")
+async def grid_ledger_clear(
+    bot_id: str,
+    symbol: str = Query(..., description="Spot symbol"),
+) -> dict[str, Any]:
+    from backend.api.grid_live_ledger import grid_live_ledger
+
+    sym = symbol.strip().upper().replace("/", "")
+    ok = grid_live_ledger.clear_user(sym)
+    if not ok:
+        raise HTTPException(
+            status_code=409,
+            detail="السجل غير مجمّد — يُمسح تلقائياً عند الإيقاف اليدوي أو يُجمّد عند الطوارئ",
+        )
+    return {"ok": True, "bot_id": bot_id, "symbol": sym, "cleared": True}
+
+
 @router.get("/{bot_id}/audit")
 async def get_audit_logs(
     bot_id: str,
@@ -419,12 +448,16 @@ async def grid_start(
                 await client.aclose()
         if mark <= 0:
             raise HTTPException(status_code=502, detail="could not fetch mark price for calibration")
+        cap = float(
+            body.allocatedCapital or body.initialCapital or hub.state.get("allocatedCapital") or 40.0
+        )
         settings = calibrated_doge_grid_settings(
             mark,
             levels=body.levels,
-            capital_usdt=float(body.initialCapital or 40.0),
+            capital_usdt=cap,
         )
         settings["symbol"] = sym
+        settings["allocatedCapital"] = cap
         if body.generatorCount is not None:
             settings["generatorCount"] = max(2, min(int(body.generatorCount), 64))
             settings["maxGeneratorCount"] = max(
@@ -439,13 +472,21 @@ async def grid_start(
         mg = body.maxGeneratorCount if body.maxGeneratorCount is not None else hub.state.get("maxGeneratorCount")
         if mg is None:
             mg = max(8, gcount)
+        alloc = float(
+            body.allocatedCapital
+            or body.initialCapital
+            or hub.state.get("allocatedCapital")
+            or hub.state.get("initialCapital")
+            or 40
+        )
         settings = {
             "symbol": sym,
             "generatorUpper": float(body.generatorUpper or hub.state.get("generatorUpper") or 0),
             "generatorLower": float(body.generatorLower or hub.state.get("generatorLower") or 0),
             "generatorCount": gcount,
             "maxGeneratorCount": max(int(mg), gcount),
-            "initialCapital": float(body.initialCapital or hub.state.get("initialCapital") or 40),
+            "allocatedCapital": alloc,
+            "initialCapital": alloc,
         }
 
     _merge_advanced_grid_settings(settings, hub_state=dict(hub.state), body=body)
@@ -465,6 +506,7 @@ async def grid_start(
             "generatorCount",
             "maxGeneratorCount",
             "initialCapital",
+            "allocatedCapital",
             "trailingOffset",
             "trailing_stop_pct",
             "compoundingFactor",
@@ -477,10 +519,29 @@ async def grid_start(
     await _persist_bot_config(db, bot_id, patch)
     await hub.merge_state(patch)
 
+    from backend.api.spot_realized_ledger import validate_grid_economics
+
+    try:
+        validate_grid_economics(
+            generator_upper=float(settings["generatorUpper"]),
+            generator_lower=float(settings["generatorLower"]),
+            generator_count=int(settings["generatorCount"]),
+            allocated_capital=float(
+                settings.get("allocatedCapital") or settings.get("initialCapital") or 0
+            ),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     try:
         result = await grid_manager.start(bot_id, settings)
-    except RuntimeError as exc:
+    except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        msg = str(exc)
+        if "Insufficient Live Balance" in msg or "allocatedCapital" in msg:
+            raise HTTPException(status_code=400, detail=msg) from exc
+        raise HTTPException(status_code=400, detail=msg) from exc
     except Exception as exc:
         _log.exception("grid_start failed")
         raise HTTPException(status_code=502, detail=f"{type(exc).__name__}: {exc}") from exc
@@ -507,16 +568,35 @@ async def grid_stop(bot_id: str, body: GridStopBody | None = None) -> dict[str, 
 
 
 @router.get("/{bot_id}/dashboard")
-async def get_dashboard(bot_id: str, db: AsyncSession = Depends(get_db_session)) -> dict[str, Any]:
-    asyncio.create_task(spot_account_sync.sync_spot_account_to_hub_once(bot_id))
+async def get_dashboard(
+    bot_id: str,
+    symbol: str | None = Query(None, description="Per-symbol room mark/settings, e.g. TRXUSDT"),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    await spot_account_sync.sync_spot_account_to_hub_once(bot_id)
     row = await db.scalar(select(BotSettings).where(BotSettings.bot_id == bot_id))
     cfg: dict[str, Any] = dict(row.config_json) if row and row.config_json else {}
-    live = hub.state
+    sym_q = symbol.strip().upper().replace("/", "") if symbol else ""
+    live = hub.room_state(sym_q) if sym_q else hub.state
     merged: dict[str, Any] = {**_DEFAULTS, **cfg, **live}
+    if sym_q:
+        merged["symbol"] = sym_q
     merged["bot_id"] = bot_id
     await apply_credentials_meta(bot_id, merged)
     if "activeGridLines" not in merged or merged.get("activeGridLines") in (None, 0):
         merged["activeGridLines"] = int(merged.get("generatorCount") or 5)
+    equity = max(
+        float(merged.get("totalWalletBalance") or merged.get("currentCapital") or 0.0),
+        0.0,
+    )
+    from backend.api.portfolio_risk import risk_metrics_snapshot
+
+    merged.update(risk_metrics_snapshot(equity_usdt=equity))
+    merged.setdefault("balanceSource", "binance_spot_live" if equity > 0 else "")
+    merged.setdefault(
+        "autoCompoundingEnabled",
+        str(merged.get("profit_injection_mode", "compound_size")).lower() == "compound_size",
+    )
     return merged
 
 
@@ -614,17 +694,81 @@ async def patch_settings(
         await db.flush()
     cfg = dict(row.config_json or {})
     cfg.update(patch)
+    state_patch = dict(patch)
+    if patch.get("autoCompoundingEnabled") is True:
+        cfg["profit_injection_mode"] = "compound_size"
+        cfg["compoundingFactor"] = 1.0
+        state_patch["profit_injection_mode"] = "compound_size"
+        state_patch["compoundingFactor"] = 1.0
     row.config_json = cfg
     row.updated_at = datetime.now(timezone.utc)
     await db.commit()
-    merged = await hub.merge_state(patch)
+    merged = await hub.merge_state(state_patch)
     await apply_credentials_meta(bot_id, merged)
-    sym = merged.get("symbol")
-    if isinstance(sym, str) and sym.strip():
-        await hub.broadcast_room(sym, {"type": "settings", "data": merged})
+    sym = str(merged.get("symbol") or hub.last_focus_symbol or "").strip().upper().replace("/", "")
+    if sym:
+        try:
+            from backend.api.binance_pool import get_spot_client
+            from backend.api.spot_realized_ledger import band_from_mark_span, band_mid_deviation_pct
+            from backend.core.exchange_filters import fetch_symbol_filters
+
+            client = await get_spot_client(bot_id)
+            if client is not None:
+                tick = await client.fetch_ticker(sym)
+                mark = float(tick.get("price") or tick.get("lastPrice") or 0)
+                if mark > 0:
+                    merged = await hub.merge_room(sym, {"markPrice": mark, "symbol": sym})
+                    symbol_changed = "symbol" in patch
+                    upper = float(merged.get("generatorUpper") or 0)
+                    lower = float(merged.get("generatorLower") or 0)
+                    if symbol_changed and band_mid_deviation_pct(
+                        generator_upper=upper,
+                        generator_lower=lower,
+                        mark_price=mark,
+                    ) > 0.35:
+                        filt = await fetch_symbol_filters(client, sym)
+                        lo, hi = band_from_mark_span(
+                            mark,
+                            span_pct=3.5,
+                            tick_size=float(filt.get("tick_size") or 0),
+                        )
+                        trail = max(mark * 0.002, float(filt.get("tick_size") or 0) or 1e-8)
+                        band_patch = {
+                            "generatorLower": lo,
+                            "generatorUpper": hi,
+                            "trailingOffset": trail,
+                        }
+                        cfg.update(band_patch)
+                        row.config_json = cfg
+                        row.updated_at = datetime.now(timezone.utc)
+                        await db.commit()
+                        merged = await hub.merge_state(band_patch)
+                        _log.info(
+                            "auto-calibrated band for %s mark=%.8g lo=%.8g hi=%.8g",
+                            sym,
+                            mark,
+                            lo,
+                            hi,
+                        )
+                    await apply_credentials_meta(bot_id, merged)
+        except Exception:
+            _log.debug("patch_settings mark fetch for %s skipped", sym, exc_info=True)
+        await hub.broadcast_room(
+            sym,
+            {"type": "settings", "data": merged},
+        )
+        await hub.broadcast_room(
+            sym,
+            {
+                "type": "mark",
+                "symbol": sym,
+                "markPrice": float(merged.get("markPrice") or 0),
+                "source": "symbol_select",
+            },
+        )
     else:
         await hub.broadcast({"type": "settings", "data": merged})
-    asyncio.create_task(spot_account_sync.sync_spot_account_to_hub_once(bot_id))
+    await spot_account_sync.sync_spot_account_to_hub_once(bot_id)
     snap = dict(merged)
     snap["bot_id"] = bot_id
     return snap
@@ -635,54 +779,18 @@ emergency_router = APIRouter()
 
 @emergency_router.post("/emergency_stop")
 async def emergency_stop(payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    """
-    Cancel all open Spot orders and market-sell remaining base asset for configured symbol.
-    """
+    """Cancel all open Spot orders, flatten base, stop all grid runners."""
     payload = payload or {}
     bot_id = str(payload.get("bot_id", "default"))
-    await hub.broadcast(
-        {
-            "type": "emergency",
-            "bot_id": bot_id,
-            "ts": datetime.now(timezone.utc).isoformat(),
-        }
-    )
-    symbols = grid_manager.active_symbols()
-    if not symbols:
-        fb = str(hub.state.get("symbol") or "DOGEUSDT").upper().replace("/", "")
-        symbols = [fb]
-    key, secret, env, legacy = await get_binance_keys(bot_id)
-    if not key or not secret:
-        _log.warning("emergency_stop: no API keys; broadcast only")
-        return {"status": "broadcast_only", "detail": "save keys in dashboard or set BINANCE_API_KEY in .env"}
+    from backend.api.emergency_service import execute_emergency_stop
 
-    client: BinanceSpotClient | None = None
-    try:
-        client = await BinanceSpotClient.create_for_env(
-            api_key=key,
-            api_secret=secret,
-            env=env,
-        )
-        for symbol in symbols:
-            await client.cancel_all_open_orders(symbol=symbol)
-            acc = await client.fetch_account()
-            free_base = client.base_asset_free(acc, symbol)
-            if free_base > 0:
-                filters = await fetch_symbol_filters(client, symbol)
-                mark_tick = await client.fetch_ticker(symbol)
-                mark = float(mark_tick.get("price") or 0)
-                _, qty_s = normalize_order(mark, free_base, filters)
-                if float(qty_s) > 0:
-                    await client.create_order(
-                        symbol=symbol,
-                        side="SELL",
-                        order_type="MARKET",
-                        quantity=qty_s,
-                    )
-        return {"status": "ok", "symbols": symbols}
-    except Exception as exc:
-        _log.exception("emergency_stop failed")
-        raise HTTPException(502, str(exc)) from exc
-    finally:
-        if client is not None:
-            await client.aclose()
+    sym_raw = payload.get("symbol")
+    sym_arg = (
+        str(sym_raw).strip().upper().replace("/", "")
+        if isinstance(sym_raw, str) and sym_raw.strip()
+        else None
+    )
+    result = await execute_emergency_stop(bot_id, symbol=sym_arg)
+    if result.get("status") == "error":
+        raise HTTPException(502, str(result.get("detail", "emergency_stop failed")))
+    return result

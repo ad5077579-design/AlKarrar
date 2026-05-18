@@ -12,7 +12,9 @@ from backend.api.grid_manager import GridManager
 def test_two_concurrent_grids(monkeypatch: pytest.MonkeyPatch) -> None:
     started: list[tuple[str, str]] = []
 
-    async def fake_start(self: object, bot_id: str, settings: dict) -> dict:
+    async def fake_start(
+        self: object, bot_id: str, settings: dict, *, resume: bool = False
+    ) -> dict:
         sym = str(settings["symbol"]).upper().replace("/", "")
         started.append((bot_id, sym))
         setattr(self, "_running", True)
@@ -27,7 +29,7 @@ def test_two_concurrent_grids(monkeypatch: pytest.MonkeyPatch) -> None:
         setattr(self, "_orders_placed", 0)
         return {"running": True}
 
-    async def fake_stop(self: object) -> dict:
+    async def fake_stop(self: object, *, manual: bool = True) -> dict:
         sym = getattr(self, "_symbol", "") or ""
         setattr(self, "_running", False)
         setattr(self, "_symbol", "")
@@ -36,6 +38,21 @@ def test_two_concurrent_grids(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr("backend.api.grid_runner.GridRunner.start", fake_start)
     monkeypatch.setattr("backend.api.grid_runner.GridRunner.stop", fake_stop)
+
+    async def fake_validate(
+        self: object,
+        bot_id: str,
+        symbol: str,
+        allocated_usdt: float,
+        *,
+        exclude_symbol: str | None = None,
+    ) -> float:
+        return 10_000.0
+
+    monkeypatch.setattr(
+        "backend.api.grid_manager.GridManager.validate_grid_allocation",
+        fake_validate,
+    )
 
     async def body() -> None:
         mgr = GridManager()

@@ -11,6 +11,7 @@ from typing import Any
 from backend.api.bot_hub import hub
 from backend.api.binance_pool import get_spot_client
 from backend.api.credential_resolver import exchange_testnet_flag, get_binance_keys
+from backend.api.dashboard_meta import apply_credentials_meta
 
 _log = logging.getLogger(__name__)
 
@@ -31,21 +32,40 @@ def _f(x: Any) -> float:
         return 0.0
 
 
-async def _broadcast_metrics(merged: dict[str, Any], *, ts_iso: str, source: str = "rest") -> None:
+async def _broadcast_metrics(
+    merged: dict[str, Any],
+    *,
+    ts_iso: str,
+    source: str = "rest",
+    bot_id: str = "default",
+) -> None:
+    """Push live account metrics to all WebSocket clients (Pinia applies via ``metrics``)."""
+    snap = dict(merged)
+    await apply_credentials_meta(bot_id, snap)
     await hub.broadcast(
         {
             "type": "metrics",
             "data": {
-                "totalWalletBalance": merged.get("totalWalletBalance"),
-                "totalMarginBalance": merged.get("totalMarginBalance"),
-                "currentCapital": merged.get("currentCapital"),
-                "marginBalance": merged.get("marginBalance"),
-                "availableBalance": merged.get("availableBalance"),
-                "floatingPnl": merged.get("floatingPnl"),
-                "realizedPnl": merged.get("realizedPnl"),
-                "syncError": merged.get("syncError"),
-                "syncOkAt": merged.get("syncOkAt"),
-                "exchangeTestnet": merged.get("exchangeTestnet"),
+                "totalWalletBalance": snap.get("totalWalletBalance"),
+                "totalMarginBalance": snap.get("totalMarginBalance"),
+                "currentCapital": snap.get("currentCapital"),
+                "marginBalance": snap.get("marginBalance"),
+                "availableBalance": snap.get("availableBalance"),
+                "floatingPnl": snap.get("floatingPnl"),
+                "realizedPnl": snap.get("realizedPnl"),
+                "syncError": snap.get("syncError", ""),
+                "syncOkAt": snap.get("syncOkAt", ""),
+                "exchangeTestnet": snap.get("exchangeTestnet"),
+                "binanceEnv": snap.get("binanceEnv", ""),
+                "credentialsConfigured": snap.get("credentialsConfigured"),
+                "binanceApiKeyPreview": snap.get("binanceApiKeyPreview", ""),
+                "peakEquityUsdt": snap.get("peakEquityUsdt"),
+                "currentDrawdownPct": snap.get("currentDrawdownPct"),
+                "trailingEquityStopEnabled": snap.get("trailingEquityStopEnabled"),
+                "trailingEquityDrawdownLimitPct": snap.get("trailingEquityDrawdownLimitPct"),
+                "trailingEquityStopTriggered": snap.get("trailingEquityStopTriggered"),
+                "reinjectedRealizedUsdt": snap.get("reinjectedRealizedUsdt"),
+                "balanceSource": snap.get("balanceSource", ""),
                 "ts": ts_iso,
                 "source": source,
             },
@@ -57,12 +77,14 @@ def _symbols_for_ticker_refresh() -> list[str]:
     try:
         from backend.api.grid_manager import grid_manager
 
-        syms = grid_manager.active_symbols()
+        syms = list(grid_manager.active_symbols())
     except Exception:
         syms = []
+    focus = str(hub.last_focus_symbol or hub.state.get("symbol") or "DOGEUSDT").upper().replace("/", "")
+    if focus and focus not in syms:
+        syms.insert(0, focus)
     if not syms:
-        fb = str(hub.state.get("symbol") or "DOGEUSDT").upper().replace("/", "")
-        syms = [fb]
+        syms = [focus or "DOGEUSDT"]
     seen: set[str] = set()
     out: list[str] = []
     for s in syms:
@@ -81,6 +103,17 @@ async def sync_spot_account_to_hub_once(
     global _last_metrics_sig, _last_mark_by_symbol
     key, secret, env, _legacy = await get_binance_keys(bot_id)
     if not key or not secret:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        await hub.merge_account(
+            {
+                "syncError": "لا توجد مفاتيح في .env — عيّن BINANCE_API_KEY و BINANCE_API_SECRET",
+                "syncOkAt": "",
+                "balanceSource": "",
+            }
+        )
+        err_snap = dict(hub.state)
+        await apply_credentials_meta(bot_id, err_snap)
+        await _broadcast_metrics(err_snap, ts_iso=now_iso, source="config", bot_id=bot_id)
         return
 
     client = await get_spot_client(bot_id)
@@ -109,13 +142,31 @@ async def sync_spot_account_to_hub_once(
                 bal["totalMarginBalance"],
                 bal["availableBalance"],
             )
-            await _broadcast_metrics(merged, ts_iso=now_iso, source=metrics_source)
+            equity = max(
+                float(merged.get("totalWalletBalance") or merged.get("currentCapital") or 0.0),
+                0.0,
+            )
+            from backend.api.portfolio_risk import portfolio_risk, risk_metrics_snapshot
+
+            portfolio_risk.check_trailing_equity_stop(equity)
+            risk_patch = risk_metrics_snapshot(equity_usdt=equity)
+            risk_patch["balanceSource"] = "binance_spot_live"
+            merged = await hub.merge_account({**merged, **risk_patch})
+            await _broadcast_metrics(merged, ts_iso=now_iso, source=metrics_source, bot_id=bot_id)
         except Exception as exc:
             msg = str(exc).strip()[:400] or type(exc).__name__
             _log.warning("spot account sync failed: %s", msg)
-            await hub.merge_account(
-                {"syncError": msg, "exchangeTestnet": exchange_testnet_flag(env), "binanceEnv": env}
+            merged = await hub.merge_account(
+                {
+                    "syncError": msg,
+                    "syncOkAt": "",
+                    "balanceSource": "",
+                    "exchangeTestnet": exchange_testnet_flag(env),
+                    "binanceEnv": env,
+                }
             )
+            await apply_credentials_meta(bot_id, merged)
+            await _broadcast_metrics(merged, ts_iso=now_iso, source="sync_error", bot_id=bot_id)
             await hub.broadcast({"type": "sync_error", "message": msg})
 
         symbol_list = _symbols_for_ticker_refresh()
@@ -143,15 +194,25 @@ async def sync_spot_account_to_hub_once(
     except Exception as exc:
         msg = str(exc).strip()[:400] or type(exc).__name__
         _log.warning("spot sync client failed: %s", msg)
-        await hub.merge_account({"syncError": msg})
+        merged = await hub.merge_account(
+            {"syncError": msg, "syncOkAt": "", "balanceSource": ""}
+        )
+        await apply_credentials_meta(bot_id, merged)
+        now_iso = datetime.now(timezone.utc).isoformat()
+        await _broadcast_metrics(merged, ts_iso=now_iso, source="sync_error", bot_id=bot_id)
         await hub.broadcast({"type": "sync_error", "message": msg})
     finally:
         pass  # pooled client — do not close per tick
 
 
-async def run_account_sync_loop(stop: asyncio.Event, *, interval_s: float = 4.0) -> None:
+async def run_account_sync_loop(
+    stop: asyncio.Event,
+    *,
+    interval_s: float = 4.0,
+    bot_id: str = "default",
+) -> None:
     while not stop.is_set():
-        await sync_spot_account_to_hub_once()
+        await sync_spot_account_to_hub_once(bot_id)
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval_s)
         except TimeoutError:

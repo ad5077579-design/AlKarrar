@@ -1,0 +1,21 @@
+---
+description: سياق مشروع AlKarrar Pro — اقرأ AGENTS.md عند بداية أي مهمة
+alwaysApply: true
+---
+
+# AlKarrar Pro
+
+**اقرأ أولاً:** [AGENTS.md](../../AGENTS.md) في جذر المستودع (تشغيل، `BINANCE_ENV`، Spot demo/testnet/mainnet، API، WS، استكشاف أخطاء).
+
+## قواعد سريعة
+
+- **Stack:** FastAPI `backend/api` (port **8090**) + Nuxt 3 `frontend/` (port **3000**). تشغيل يدوي: `scripts/run_api.ps1`, `scripts/run_frontend.ps1` — أو **موحّد:** `restart_all.ps1` (جذر المشروع) يفرّغ المنافذ ويشغِّل الاثنين؛ الـ API افتراضياً مع `--reload` لمطابقة كود جديد.
+- **تطوير:** `apiBase` و `wsUrl` فارغان → `/api` و `/ws` عبر proxy إلى `127.0.0.1:8090` (`nuxt.config.ts`).
+- **بيئة Spot:** `BINANCE_ENV` = `mainnet` | `testnet` | `demo` في `.env` (افتراضي المثال: **demo** من demo.binance.com). بدونها: `BINANCE_TESTNET=true` → testnet.
+- **عميل:** `BinanceSpotClient.create_for_env(env=...)` + `get_binance_keys(bot_id)` → `env`. التوجيه في `backend/core/binance_env.py`.
+- **حقول عقدية (لا تُعاد تسميتها):** `generatorUpper`, `generatorLower`, `generatorCount`, `initialCapital`, `binanceApiKey`, `binanceApiSecret`, `binanceTestnet`.
+- **عرض:** `binanceEnv` على hub/dashboard؛ `binanceTestnet` = غير mainnet (testnet أو demo).
+- **بث حي:** `spot_account_sync` + `spot_user_stream` (قد يفشل listenKey على demo) + `mark_feed` → hub → WS `/ws` → Pinia.
+- **لا secrets في Git أو في ردود الدردشة.**
+
+عند تعديل ميزة، طابق أسلوب الملفات المجاورة؛ لا refactors واسعة خارج الطلب.

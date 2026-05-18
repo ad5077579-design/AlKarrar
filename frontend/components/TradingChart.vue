@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import {
   createChart,
+  createSeriesMarkers,
   LineSeries,
   CandlestickSeries,
   ColorType,
@@ -9,12 +10,14 @@ import type {
   AutoscaleInfo,
   IChartApi,
   ISeriesApi,
+  ISeriesMarkersPluginApi,
   LogicalRangeChangeEventHandler,
   UTCTimestamp,
   CandlestickData,
   Time,
 } from "lightweight-charts"
 import { useBotStore } from "~/stores/bot"
+import { buildTradeMarkers, mergeTradesForSymbol } from "~/utils/chartTradeMarkers"
 
 const store = useBotStore()
 const cfg = useRuntimeConfig()
@@ -33,6 +36,7 @@ let syncedCandles: CandlestickData<Time>[] = []
 let chart: IChartApi | null = null
 let candleSeries: ISeriesApi<"Candlestick"> | null = null
 let lineSeries: ISeriesApi<"Line"> | null = null
+let tradeMarkers: ISeriesMarkersPluginApi<Time> | null = null
 /** Series that owns generator / grid price lines */
 let priceLineHost: ISeriesApi<"Candlestick"> | ISeriesApi<"Line"> | null = null
 const priceLines = shallowRef<object[]>([])
@@ -419,6 +423,8 @@ function ensureCandleSeries(candles: CandlestickData<Time>[]) {
       applyDefaultViewport()
     }
     updateLiveCandleFromMark(store.markPrice)
+    ensureTradeMarkersPlugin()
+    applyTradeMarkers()
   } catch (e) {
     klinesError.value = `lightweight-charts: ${String(e)}`
   }
@@ -428,6 +434,42 @@ function rebuildPriceLinesAfterSeriesReady() {
   if (!chart) return
   priceLineHost = candleSeries ?? lineSeries
   rebuildPriceLines()
+}
+
+function candleTimeBounds(): { min?: number; max?: number } {
+  if (!syncedCandles.length) return {}
+  const min = syncedCandles[0].time as number
+  const max = (syncedCandles[syncedCandles.length - 1].time as number) + KLINES_INTERVAL_SEC
+  return { min, max }
+}
+
+function ensureTradeMarkersPlugin() {
+  if (!candleSeries) return
+  if (!tradeMarkers) {
+    tradeMarkers = createSeriesMarkers(candleSeries, [])
+  }
+}
+
+function applyTradeMarkers() {
+  if (!tradeMarkers || !candleSeries) return
+  const sym = resolveKlinesSymbol()
+  const pack = store.symbolTradesPack(sym)
+  const merged = mergeTradesForSymbol(sym, pack.trades, store.trades)
+  const { min, max } = candleTimeBounds()
+  const markers = buildTradeMarkers(merged, {
+    symbol: sym,
+    intervalSec: KLINES_INTERVAL_SEC,
+    minTimeSec: min,
+    maxTimeSec: max,
+    limit: 250,
+  })
+  tradeMarkers.setMarkers(markers)
+}
+
+async function loadTradesForChart() {
+  const sym = resolveKlinesSymbol()
+  await store.fetchTradesForSymbol(sym, { quiet: true })
+  applyTradeMarkers()
 }
 
 onMounted(async () => {
@@ -487,6 +529,7 @@ onMounted(async () => {
   bindViewportLockHandlers()
   rebuildPriceLinesAfterSeriesReady()
   applyMarkData()
+  void loadTradesForChart()
 
   if (candles.length === 0 && !klinesError.value) {
     klinesRetryTimer = globalThis.setTimeout(async () => {
@@ -495,6 +538,7 @@ onMounted(async () => {
       const retry = await loadKlines()
       ensureCandleSeries(retry)
       rebuildPriceLinesAfterSeriesReady()
+      void loadTradesForChart()
     }, 900)
   }
 
@@ -529,18 +573,54 @@ watch(
   },
 )
 
-watch(
-  () => store.symbol,
-  async () => {
-    if (!chart || !candleSeries) return
-    store.clearMarkSeries()
-    syncedCandles = []
-    viewportLockedByUser = false
-    chart.applyOptions({ rightPriceScale: { autoScale: true } })
+async function reloadChartForSymbol() {
+  if (!chart) return
+  isLoading.value = true
+  klinesError.value = null
+  store.clearMarkSeries()
+  syncedCandles = []
+  viewportLockedByUser = false
+  suppressViewportLock = true
+  chart.applyOptions({ rightPriceScale: { autoScale: true } })
+  try {
     const candles = await loadKlines()
+    if (!candleSeries && chart) {
+      candleSeries = chart.addSeries(CandlestickSeries, {
+        ...CANDLE_SERIES_OPTS,
+        autoscaleInfoProvider: AUTOSCALE_FROM_CANDLES,
+      })
+      priceLineHost = candleSeries
+    }
     ensureCandleSeries(candles)
     rebuildPriceLinesAfterSeriesReady()
     applyMarkData()
+    if (store.markPrice > 0) updateLiveCandleFromMark(store.markPrice)
+    void loadTradesForChart()
+  } finally {
+    suppressViewportLock = false
+    isLoading.value = false
+  }
+}
+
+watch(
+  () => store.symbol,
+  () => {
+    void reloadChartForSymbol()
+  },
+)
+
+watch(
+  () => {
+    const sym = resolveKlinesSymbol()
+    return [
+      sym,
+      store.trades.length,
+      store.tradesBySymbol[sym]?.trades?.length ?? 0,
+      store.tradesBySymbol[sym]?.updatedAt ?? "",
+    ]
+  },
+  () => {
+    applyTradeMarkers()
   },
 )
 
@@ -552,6 +632,8 @@ onBeforeUnmount(() => {
   }
   unbindViewportLockHandlers()
   clearPriceLines()
+  tradeMarkers?.detach()
+  tradeMarkers = null
   chart?.remove()
   chart = null
   viewportLockedByUser = false
@@ -568,7 +650,11 @@ onBeforeUnmount(() => {
       <button type="button" class="chart-reset-btn" @click="resetChartViewport">
         إعادة ضبط التكبير
       </button>
-      <span class="chart-hint muted">عجلة الفأرة: تكبير · سحب: تحريك · محور السعر: سحب عمودي</span>
+      <span class="chart-legend">
+        <span class="legend-item buy">▲ شراء</span>
+        <span class="legend-item sell">▼ بيع</span>
+      </span>
+      <span class="chart-hint muted">عجلة الفأرة: تكبير · سحب: تحريك</span>
     </div>
     <p v-if="klinesError" class="klines-err" role="status">{{ klinesError }}</p>
     <div class="chart-stage">
@@ -603,6 +689,19 @@ onBeforeUnmount(() => {
 .chart-reset-btn:hover {
   border-color: #38bdf8;
   color: #38bdf8;
+}
+.chart-legend {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+}
+.legend-item.buy {
+  color: #0ecb81;
+}
+.legend-item.sell {
+  color: #f6465d;
 }
 .chart-hint {
   font-size: 0.72rem;

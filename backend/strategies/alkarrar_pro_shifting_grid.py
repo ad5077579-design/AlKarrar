@@ -19,7 +19,12 @@ from typing import Any, Literal
 
 import aiosqlite
 
-from backend.core.exchange_filters import fetch_symbol_filters, normalize_order, quantize_price
+from backend.core.exchange_filters import (
+    fetch_symbol_filters,
+    format_base_qty_from_usdt_slice,
+    normalize_order,
+    quantize_price,
+)
 from backend.core.binance_client import BinanceSpotClient, parse_spot_balances
 from backend.main_engine import GeneratorBand, Side, build_dca_levels
 from backend.project_paths import data_dir
@@ -33,7 +38,6 @@ from backend.strategies.virtual_grid_book import (
 from backend.api.audit_log_service import (
     GRID_SHIFT,
     PROFIT_INJECT_COMPOUND,
-    PROFIT_INJECT_EXPAND,
     SYSTEM_ERROR,
     TAKE_PROFIT_MARKET,
     TRAILING_STARTED,
@@ -44,6 +48,18 @@ _log = logging.getLogger(__name__)
 
 # عمولة شبكة بينانس Spot الافتراضية (ماركت/تيكر) — تقدير محافظ لتغطية العمولة المقتطعة من أصل الأساس بعد الشراء.
 # يمكن تجاوزها بـ ALKARRAR_SPOT_TAKER_FEE_RATIO=0.001
+def _bootstrap_market_buy_enabled() -> bool:
+    raw = str(os.getenv("ALKARRAR_GRID_BOOTSTRAP_MARKET", "0")).strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _bootstrap_market_max_quote_fraction() -> Decimal:
+    try:
+        return Decimal(str(os.getenv("ALKARRAR_GRID_BOOTSTRAP_MAX_DEPLOY_FRAC", "0.35")))
+    except Exception:
+        return Decimal("0.35")
+
+
 def _bootstrap_taker_buy_fee_decimal() -> Decimal:
     raw = (os.getenv("ALKARRAR_SPOT_TAKER_FEE_RATIO") or "").strip()
     try:
@@ -135,7 +151,6 @@ async def _await_free_base_raise(
         await asyncio.sleep(poll_s)
     return last_fb, "timeout"
 
-ProfitInjectionMode = Literal["expand_count", "compound_size"]
 DcaMode = Literal["equal", "log"]
 RearmMode = Literal["full", "qty_only"]
 
@@ -154,6 +169,28 @@ class LineTrailState:
     tp_level: float = 0.0
     lock_floor: float = 0.0
     trail_peak: float = 0.0
+    trailing_audit_done: bool = False
+    exchange_fill_confirmed: bool = False
+
+
+def spot_order_filled(res: dict[str, Any] | None) -> bool:
+    """True only when Binance reports ``status: FILLED`` with executed quantity."""
+    if not res:
+        return False
+    if str(res.get("status") or "").upper() != "FILLED":
+        return False
+    try:
+        executed = float(res.get("executedQty") or 0)
+    except (TypeError, ValueError):
+        executed = 0.0
+    return executed > 0
+
+
+def executed_qty_from_response(res: dict[str, Any]) -> float:
+    try:
+        return max(float(res.get("executedQty") or 0), 0.0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 @dataclass
@@ -169,6 +206,7 @@ class ShiftingGridRAM:
 
     last_price: float = 0.0
     cumulative_realized_usdt: float = 0.0
+    cumulative_realized_at_last_resize: float = 0.0
     profit_bank_usdt: float = 0.0
     injections_done: int = 0
 
@@ -210,12 +248,19 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
         self._lift_above_offset: float = 0.0
         self._trailing_stop_pct: float = 0.01
         self._boundary_epsilon_pct: float = 0.0005
-        self._profit_injection_mode: ProfitInjectionMode = "expand_count"
         self._boundary_reinvest_frac: float = 0.25
         self._lot_expand_step_pct: float = 0.05
-        self._hybrid_line_cap: bool = False
-        self._max_generator_count: int = 999999
+        self._last_available_usdt: float = 0.0
+        self._compound_resize_pct: float = 0.01
+        self._upper_sell_armed_count: int = 0
+        self._upper_sell_completed: int = 0
+        self._asymmetric_shift_active: bool = False
         self._line_exit_mutex: set[int] = set()
+        self._line_fill_mutex: set[int] = set()
+        self._filled_order_ids: dict[str, int] = {}
+        self._last_memory_prune_mono: float = 0.0
+        self._persisted_grid_settings: dict[str, Any] = {}
+        self._session_start_ms_persisted: int = 0
         self._db_path = data_dir() / "trader.db"
         self._db_queue: asyncio.Queue[str | None] = asyncio.Queue(maxsize=1)
         self._db_worker: asyncio.Task[None] | None = None
@@ -223,6 +268,10 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
         self._virtual_book: VirtualGridBook | None = None
         self._prev_mark: float = 0.0
         self._dca_mode: DcaMode = "equal"
+        self._allocated_capital_usdt: float = 0.0
+        self._session_base_inventory: float = 0.0
+        self._lines_with_confirmed_buy: set[int] = set()
+        self._line_ioc_cooldown_until: dict[int, float] = {}
 
     async def on_start(self, bot_id: str, settings: dict[str, Any]) -> None:
         if not isinstance(self._exchange, BinanceSpotClient):
@@ -248,34 +297,53 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
         if count < 2 or not (lower < upper):
             raise ValueError("require generatorLower < generatorUpper and generatorCount >= 2")
 
-        self._hybrid_line_cap = "maxGeneratorCount" in settings
-        self._max_generator_count = max(int(settings.get("maxGeneratorCount") or count), count)
-        if not self._hybrid_line_cap:
-            self._max_generator_count = 999999
-
         self._filters = await fetch_symbol_filters(self._exchange, self._symbol)
         upper = quantize_price(upper, self._filters.get("tick_size", 0))
         lower = quantize_price(lower, self._filters.get("tick_size", 0))
         if not (lower < upper):
             raise ValueError("quantized band invalid for symbol filters")
 
-        ic = float(settings["initialCapital"])
+        ic = float(settings.get("allocatedCapital") or settings.get("initialCapital") or 0.0)
+        if ic <= 0:
+            raise ValueError("allocatedCapital must be > 0")
+        self._allocated_capital_usdt = ic
         trail_off = float(settings["trailingOffset"])
-        comp = float(settings["compoundingFactor"])
+        comp = float(settings.get("compoundingFactor") or 1.0)
 
         band = GeneratorBand(generatorUpper=upper, generatorLower=lower, generatorCount=count)
         levels = build_dca_levels(band, mode=self._dca_mode)
         tick = self._filters.get("tick_size", 0)
         levels = [quantize_price(lv, tick) for lv in levels]
-        slice_usdt = ic / max(len(levels), 1)
+
+        deploy_usdt = ic
+        self._last_available_usdt = deploy_usdt
+        mark_px = 0.0
+        try:
+            tick = await self._exchange.fetch_ticker(self._symbol)
+            for k in ("price", "lastPrice", "last"):
+                try:
+                    mark_px = float(tick.get(k) or 0)
+                except (TypeError, ValueError):
+                    mark_px = 0.0
+                if mark_px > 0:
+                    break
+        except Exception:
+            mark_px = 0.0
         mid = (upper + lower) / 2.0
-        qty_base = slice_usdt / max(mid, 1e-12)
+        sizing_mark = mark_px if mark_px > 0 else mid
+        qty_base = 0.0
+        if deploy_usdt > 0 and sizing_mark > 0:
+            qty_base, _ = format_base_qty_from_usdt_slice(
+                usdt_per_line=deploy_usdt / max(count, 1),
+                mark=sizing_mark,
+                filters=self._filters,
+            )
 
         self._ram = ShiftingGridRAM(
             generatorUpper=upper,
             generatorLower=lower,
             generatorCount=count,
-            initialCapital=ic,
+            initialCapital=deploy_usdt,
             trailingOffset=trail_off,
             compoundingFactor=comp,
             order_quantity_base=qty_base,
@@ -287,18 +355,55 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
         self._lift_above_offset = float(settings.get("lift_above_offset", default_lift))
         self._trailing_stop_pct = float(settings.get("trailing_stop_pct", 0.01))
         self._boundary_epsilon_pct = float(settings.get("boundary_epsilon_pct", 0.0005))
-        mode = str(settings.get("profit_injection_mode", "expand_count")).lower()
-        self._profit_injection_mode = "compound_size" if mode == "compound_size" else "expand_count"
         self._boundary_reinvest_frac = float(settings.get("boundary_reinvest_frac", 0.25))
         self._lot_expand_step_pct = float(settings.get("lot_expand_step_pct", 0.05))
+        self._compound_resize_pct = _compound_resize_pct_from_env(settings)
+        self._upper_sell_armed_count = 0
+        self._upper_sell_completed = 0
+        self._asymmetric_shift_active = False
+        self._session_base_inventory = 0.0
+        self._lines_with_confirmed_buy = set()
+        self._line_ioc_cooldown_until = {}
+        self._persisted_grid_settings = dict(settings)
+        self._binance_env = str(settings.get("binanceEnv") or "")
+        self._credentials_fingerprint = str(settings.get("credentialsFingerprint") or "")
+        resume_snap = settings.get("resumeFromSnapshot")
+        if isinstance(resume_snap, dict):
+            self._session_start_ms_persisted = int(
+                settings.get("resumeSessionStartMs") or resume_snap.get("sessionStartMs") or 0
+            )
+        else:
+            self._session_start_ms_persisted = int(time.time() * 1000)
+
+        if mark_px > 0 and not isinstance(resume_snap, dict):
+            from backend.api.spot_realized_ledger import validate_band_matches_symbol_mark
+
+            validate_band_matches_symbol_mark(
+                generator_upper=upper,
+                generator_lower=lower,
+                mark_price=mark_px,
+                symbol=self._symbol,
+            )
 
         await _ensure_shifting_grid_table(self._db_path)
         self._db_worker = asyncio.create_task(self._db_worker_loop(), name="shifting-grid-db")
 
-        asyncio.create_task(self._bootstrap_open_grid(), name="shifting-grid-bootstrap")
+        if isinstance(resume_snap, dict):
+            self._restore_from_snapshot(resume_snap)
+            asyncio.create_task(self._finalize_resume_after_restore(), name="shifting-grid-resume")
+        else:
+            asyncio.create_task(self._bootstrap_open_grid(), name="shifting-grid-bootstrap")
 
     async def on_stop(self, bot_id: str) -> None:
         self._running = False
+        self._asymmetric_shift_active = False
+        self._session_base_inventory = 0.0
+        self._lines_with_confirmed_buy = set()
+        self._line_ioc_cooldown_until = {}
+        self._line_fill_mutex.clear()
+        self._filled_order_ids.clear()
+        self._persisted_grid_settings = {}
+        self._session_start_ms_persisted = 0
         if self._virtual_book is not None:
             self._virtual_book.lines.clear()
         self._virtual_book = None
@@ -331,21 +436,25 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
             if d != 0.0:
                 self._ram.cumulative_realized_usdt += d
                 if d > 0:
-                    frac = (
-                        self._boundary_reinvest_frac
-                        if (not self._hybrid_line_cap or self._generator_at_line_cap())
-                        else 0.0
-                    )
-                    self._ram.profit_bank_usdt += d * frac
+                    self._ram.profit_bank_usdt += d * self._boundary_reinvest_frac
+
+        deploy_raw = market.get("deploy_usdt")
+        if deploy_raw is None:
+            deploy_raw = market.get("available_usdt")
+        if deploy_raw is not None:
+            try:
+                self._last_available_usdt = max(float(deploy_raw), 0.0)
+            except (TypeError, ValueError):
+                pass
 
         prev_mark = self._prev_mark if self._prev_mark > 0 else price
         self._ram.last_price = price
 
+        self._maybe_prune_stale_memory()
         self._boundary_eval(price)
-        self._profit_injection_eval()
-        lifted = self._lift_eval_and_mutate_ram(price)
-        if lifted:
-            asyncio.create_task(self._io_dynamic_lift(), name="shifting-lift-io")
+        if self._should_auto_recenter_on_price(price):
+            if self._recenter_grid_on_pivot(price, reason="price_breakout"):
+                asyncio.create_task(self._io_dynamic_lift(), name="shifting-lift-io")
 
         self._trailing_eval(price)
         for idx, snap in self._consume_trailing_exits(price):
@@ -353,6 +462,10 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
 
         crossed = self._virtual_crossed(prev_mark, price)
         for ln in crossed[:1]:
+            if ln.line_index in self._line_fill_mutex or ln.triggered or not ln.armed:
+                continue
+            self._line_fill_mutex.add(ln.line_index)
+            ln.armed = False
             asyncio.create_task(
                 self._execute_virtual_line(ln, mark=price),
                 name=f"vgrid-fill-{ln.line_index}",
@@ -367,7 +480,33 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
         self._ram.line_trail.clear()
         for i, lv in enumerate(levels):
             tp = lv + self._ram.trailingOffset if self._first_side == Side.BUY else lv - self._ram.trailingOffset
-            self._ram.line_trail[i] = LineTrailState(phase=LineTrailPhase.idle, tp_level=tp, lock_floor=0.0, trail_peak=0.0)
+            self._ram.line_trail[i] = LineTrailState(
+                phase=LineTrailPhase.idle,
+                tp_level=tp,
+                lock_floor=0.0,
+                trail_peak=0.0,
+                trailing_audit_done=False,
+                exchange_fill_confirmed=False,
+            )
+
+    def _sync_line_trail_to_levels(self, levels: list[float]) -> None:
+        """Keep line_trail indices aligned with generatorCount (prune extras, add missing)."""
+        n = len(levels)
+        for k in list(self._ram.line_trail.keys()):
+            if k >= n:
+                del self._ram.line_trail[k]
+        for i, lv in enumerate(levels):
+            if i in self._ram.line_trail:
+                continue
+            tp = lv + self._ram.trailingOffset if self._first_side == Side.BUY else lv - self._ram.trailingOffset
+            self._ram.line_trail[i] = LineTrailState(
+                phase=LineTrailPhase.idle,
+                tp_level=tp,
+                lock_floor=0.0,
+                trail_peak=0.0,
+                trailing_audit_done=False,
+                exchange_fill_confirmed=False,
+            )
 
     def _rebuild_levels(self) -> list[float]:
         band = GeneratorBand(
@@ -391,12 +530,17 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
                     "tpLevel": float(st.tp_level),
                     "trailPeak": float(st.trail_peak),
                     "lockFloor": float(st.lock_floor),
+                    "exchangeFillConfirmed": bool(st.exchange_fill_confirmed),
+                    "hasSessionBuy": bool(self._line_has_confirmed_buy(idx)),
                 }
             )
         return rows
 
     def _classify_levels_by_mark(
-        self, mark: float
+        self,
+        mark: float,
+        *,
+        buys_only_strict_below: bool = False,
     ) -> tuple[list[tuple[int, float]], list[tuple[int, float]]]:
         """Split grid indices into virtual BUY (at/below mark) and SELL (above mark) rows."""
         levels = self._rebuild_levels()
@@ -426,11 +570,75 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
         else:
             neutral = list(level_rows)
 
+        if buys_only_strict_below:
+            return list(lower), []
+
         buy_levels = lower + neutral
         sell_levels = upper
         return buy_levels, sell_levels
 
-    def _rearm_virtual_ladder(self, *, reason: str, mode: RearmMode = "full") -> None:
+    def _rearm_is_asymmetric(self, reason: str, asymmetric_buys_only: bool) -> bool:
+        if asymmetric_buys_only or self._asymmetric_shift_active:
+            return True
+        return reason in ("grid_lift", "last_upper_sell_closed", "price_breakout")
+
+    def _maybe_arm_paired_sell_after_buy(self, buy_line_index: int) -> None:
+        """
+        After auto-shift: arm the next grid rung as SELL only once its BUY filled (no pre-seeded sells).
+        """
+        if not self._asymmetric_shift_active or not self._virtual_book or self._first_side != Side.BUY:
+            return
+        levels = self._rebuild_levels()
+        sell_idx = int(buy_line_index) + 1
+        if sell_idx >= len(levels):
+            return
+        existing = self._virtual_book.lines.get(sell_idx)
+        if existing is not None and (existing.triggered or existing.armed):
+            return
+        sell_px = float(levels[sell_idx])
+        buy_px = float(levels[buy_line_index])
+        if sell_px <= buy_px:
+            return
+        qty_eff = self._effective_order_qty()
+        try:
+            price_s, qty_s = self._normalize_order(sell_px, qty_eff)
+        except Exception:
+            return
+        if float(qty_s) <= 0 or float(price_s) <= 0:
+            return
+        lo = self._ram.generatorLower
+        hi = self._ram.generatorUpper
+        span = max(hi - lo, 1e-12)
+        bucket: Literal["all", "lower", "upper"] = "all"
+        if abs(sell_px - lo) <= span * 0.08:
+            bucket = "lower"
+        elif abs(sell_px - hi) <= span * 0.08:
+            bucket = "upper"
+        self._virtual_book.register(
+            line_index=sell_idx,
+            price=sell_px,
+            price_s=price_s,
+            qty_s=qty_s,
+            side=Side.SELL,
+            bucket=bucket,
+        )
+        self._audit(
+            "VIRTUAL_PAIR_SELL_ARMED",
+            details={
+                "buy_line_index": int(buy_line_index),
+                "sell_line_index": sell_idx,
+                "sell_price": sell_px,
+                "asymmetric_shift": True,
+            },
+        )
+
+    def _rearm_virtual_ladder(
+        self,
+        *,
+        reason: str,
+        mode: RearmMode = "full",
+        asymmetric_buys_only: bool = False,
+    ) -> None:
         """
         Keep virtual RAM aligned after expand / compound / lift.
 
@@ -475,7 +683,13 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
             )
             return
 
-        buy_rows, sell_rows = self._classify_levels_by_mark(mark)
+        asymmetric = self._rearm_is_asymmetric(reason, asymmetric_buys_only)
+        buy_rows, sell_rows = self._classify_levels_by_mark(
+            mark,
+            buys_only_strict_below=asymmetric,
+        )
+        if asymmetric:
+            sell_rows = []
         lo = self._ram.generatorLower
         hi = self._ram.generatorUpper
         span = max(hi - lo, 1e-12)
@@ -516,6 +730,7 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
             details={
                 "reason": reason,
                 "mode": mode,
+                "asymmetric_buys_only": asymmetric,
                 "lines_registered": registered,
                 "armed_total": self._virtual_book.armed_count(),
                 "generatorCount": int(self._ram.generatorCount),
@@ -523,7 +738,96 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
             },
         )
 
+    def _reference_price(self, price: float, *, mark: float | None = None) -> float:
+        """Conservative notional reference: never under-price vs live mark (prevents oversized base qty)."""
+        return max(
+            float(price or 0),
+            float(mark or 0),
+            float(self._ram.last_price or 0),
+        )
+
+    def _usdt_per_line_budget(self) -> float:
+        alloc = max(
+            float(getattr(self, "_allocated_capital_usdt", 0.0) or self._ram.initialCapital),
+            0.0,
+        )
+        n = max(int(self._ram.generatorCount), 1)
+        profit = max(float(self._ram.cumulative_realized_usdt), 0.0)
+        deploy = alloc + profit
+        return deploy / n
+
+    def _cap_qty_to_line_budget(
+        self,
+        price: float,
+        qty: float,
+        *,
+        mark: float | None = None,
+    ) -> float:
+        ref_px = self._reference_price(price, mark=mark)
+        if ref_px <= 0 or qty <= 0:
+            return 0.0
+        budget = self._usdt_per_line_budget()
+        if budget <= 0:
+            return qty
+        notional = qty * ref_px
+        if notional <= budget * 1.02:
+            return qty
+        capped, _ = format_base_qty_from_usdt_slice(
+            usdt_per_line=budget,
+            mark=ref_px,
+            filters=self._filters,
+        )
+        return min(qty, capped) if capped > 0 else qty
+
+    def _cap_sell_to_session_inventory(self, qty: float) -> float:
+        """Ring-fence sells: only base bought in this grid session."""
+        req = max(float(qty), 0.0)
+        hook = getattr(self, "_ledger_cap_sell_cb", None)
+        if callable(hook):
+            try:
+                capped = float(hook(req))
+                if capped >= 0:
+                    req = capped
+            except Exception:
+                pass
+        avail = max(float(self._session_base_inventory), 0.0)
+        return min(req, avail) if avail > 0 else 0.0
+
+    def _apply_session_inventory_delta(self, side: Side, res: dict[str, Any]) -> None:
+        if not spot_order_filled(res):
+            return
+        dq = executed_qty_from_response(res)
+        if dq <= 0:
+            return
+        if self._first_side == Side.BUY:
+            if side == Side.BUY:
+                self._session_base_inventory += dq
+            elif side == Side.SELL:
+                self._session_base_inventory = max(self._session_base_inventory - dq, 0.0)
+        else:
+            if side == Side.SELL:
+                self._session_base_inventory += dq
+            elif side == Side.BUY:
+                self._session_base_inventory = max(self._session_base_inventory - dq, 0.0)
+
+    def _qty_for_virtual_line(self, line: VirtualGridLine, *, mark: float | None = None) -> float:
+        ref_px = self._reference_price(line.price, mark=mark)
+        budget = self._usdt_per_line_budget()
+        slice_qty, qty_s = format_base_qty_from_usdt_slice(
+            usdt_per_line=budget,
+            mark=ref_px,
+            filters=self._filters,
+        )
+        if slice_qty > 0:
+            return slice_qty
+        try:
+            return float(qty_s)
+        except (TypeError, ValueError):
+            return 0.0
+
     def _normalize_order(self, price: float, qty: float) -> tuple[str, str]:
+        ref_px = self._reference_price(price)
+        qty = self._cap_qty_to_line_budget(ref_px, qty, mark=ref_px)
         hook = getattr(self, "_quantize_hooks", None)
         if callable(hook):
             p, q = hook(price, qty)
@@ -549,14 +853,97 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
             realized_usdt=float(realized_usdt or 0.0),
             details=d,
         )
+        if event_type not in ("VIRTUAL_GRID_FILL", "TAKE_PROFIT_MARKET"):
+            try:
+                from backend.api.grid_live_ledger import log_from_audit_event
 
-    def _generator_at_line_cap(self) -> bool:
-        return self._ram.generatorCount >= self._max_generator_count
+                log_from_audit_event(
+                    self,
+                    event_type,
+                    realized_usdt=float(realized_usdt or 0.0),
+                    details=d,
+                )
+            except Exception:
+                pass
 
-    def _should_expand_generator_on_injection(self) -> bool:
-        if self._hybrid_line_cap:
-            return self._ram.generatorCount < self._max_generator_count
-        return self._profit_injection_mode == "expand_count"
+    def effective_deploy_usdt(self) -> float:
+        """Ring-fenced capital: frozen allocatedCapital + this grid's cumulative realized only."""
+        alloc = max(
+            float(getattr(self, "_allocated_capital_usdt", 0.0) or self._ram.initialCapital),
+            0.0,
+        )
+        return max(alloc + float(self._ram.cumulative_realized_usdt), 0.0)
+
+    def refresh_order_size_from_capital(
+        self,
+        *,
+        deploy_usdt: float | None = None,
+        available_usdt: float | None = None,
+        mark: float,
+        reason: str = "cycle",
+        force: bool = False,
+    ) -> bool:
+        """
+        Resize when cumulative realized since last resize >= compound_resize_pct * deploy.
+        Order size per line = ring-fenced deploy / generatorCount (not wallet balance).
+        """
+        n = max(int(self._ram.generatorCount), 1)
+        deploy = float(deploy_usdt if deploy_usdt is not None else available_usdt if available_usdt is not None else 0.0)
+        if deploy <= 0:
+            deploy = self.effective_deploy_usdt()
+        deploy = min(deploy, self.effective_deploy_usdt())
+        if deploy <= 0 or mark <= 0:
+            return False
+
+        new_profit = self._ram.cumulative_realized_usdt - self._ram.cumulative_realized_at_last_resize
+        threshold_usdt = deploy * max(self._compound_resize_pct, 0.0)
+        eligible = force or threshold_usdt <= 0 or new_profit >= threshold_usdt
+        if not eligible:
+            return False
+
+        slice_usdt = deploy / n
+        new_qty, qty_s = format_base_qty_from_usdt_slice(
+            usdt_per_line=slice_usdt,
+            mark=mark,
+            filters=self._filters,
+        )
+        if new_qty <= 0 or qty_s == "0":
+            return False
+
+        prev_qty = float(self._ram.order_quantity_effective)
+        self._ram.order_quantity_base = new_qty
+        self._ram.order_quantity_effective = new_qty
+        changed = abs(new_qty - prev_qty) > max(prev_qty * 1e-8, 1e-12)
+        if changed:
+            self._ram.injections_done += 1
+            self._audit(
+                PROFIT_INJECT_COMPOUND,
+                realized_usdt=0.0,
+                details={
+                    "reason": reason,
+                    "profit_injection_mode": "compound_size",
+                    "compound_resize_pct": self._compound_resize_pct,
+                    "new_realized_since_resize": round(new_profit, 8),
+                    "resize_threshold_usdt": round(threshold_usdt, 8),
+                    "deploy_usdt": round(deploy, 8),
+                    "usdt_per_line": round(slice_usdt, 8),
+                    "qty_formatted": qty_s,
+                    "generatorCount": int(self._ram.generatorCount),
+                    "order_quantity_effective_before": prev_qty,
+                    "order_quantity_effective_after": float(new_qty),
+                    "cumulative_realized_usdt": round(self._ram.cumulative_realized_usdt, 8),
+                },
+            )
+            _log.info(
+                "dynamic_capital_sizing reason=%s avail=%.4f count=%s qty_eff=%s",
+                reason,
+                deploy,
+                n,
+                qty_s,
+            )
+        if changed or eligible:
+            self._ram.cumulative_realized_at_last_resize = float(self._ram.cumulative_realized_usdt)
+        return changed or eligible
 
     def _boundary_eval(self, price: float) -> None:
         lo = self._ram.generatorLower
@@ -565,95 +952,104 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
             if not self._ram.boundary_mode:
                 _log.info("boundary_mode: price touched lower band")
             self._ram.boundary_mode = True
-            step = self._lot_expand_step_pct * max(self._ram.profit_bank_usdt, 0.0) / max(
-                self._ram.initialCapital, 1e-9
-            )
+            deploy = max(self.effective_deploy_usdt(), 1e-9)
+            step = self._lot_expand_step_pct * max(self._ram.profit_bank_usdt, 0.0) / deploy
             if step > 0:
                 self._ram.lot_expansion_multiplier += min(step, self._lot_expand_step_pct)
                 self._ram.profit_bank_usdt *= 1.0 - self._boundary_reinvest_frac
 
-    def _profit_injection_eval(self) -> None:
-        n = max(self._ram.generatorCount, 1)
-        cost_per_level = self._ram.initialCapital / n
-        if cost_per_level <= 0:
-            return
-        threshold = (self._ram.injections_done + 1) * cost_per_level
-        if self._ram.cumulative_realized_usdt < threshold:
-            return
-        self._ram.injections_done += 1
-        if self._should_expand_generator_on_injection():
-            prev_count = int(self._ram.generatorCount)
-            self._ram.generatorCount += 1
-            levels = self._rebuild_levels()
-            self._init_line_trail_states(levels)
-            slice_usdt = self._ram.initialCapital / max(len(levels), 1)
-            mid = (self._ram.generatorUpper + self._ram.generatorLower) / 2.0
-            self._ram.order_quantity_effective = slice_usdt / max(mid, 1e-12)
-            self._audit(
-                PROFIT_INJECT_EXPAND,
-                details={
-                    "generatorCount_before": prev_count,
-                    "generatorCount_after": int(self._ram.generatorCount),
-                    "injections_done": int(self._ram.injections_done),
-                    "hybrid_line_cap": self._hybrid_line_cap,
-                    "maxGeneratorCount": self._max_generator_count,
-                    "cumulative_realized_usdt_after": round(self._ram.cumulative_realized_usdt, 8),
-                },
-            )
-            self._rearm_virtual_ladder(reason="profit_inject_expand", mode="full")
-        else:
-            prev_qty = float(self._ram.order_quantity_effective)
-            f = max(self._ram.compoundingFactor, 0.0)
-            self._ram.order_quantity_effective *= 1.0 + f
-            self._audit(
-                PROFIT_INJECT_COMPOUND,
-                details={
-                    "order_quantity_effective_before": prev_qty,
-                    "order_quantity_effective_after": float(self._ram.order_quantity_effective),
-                    "compounding_factor_applied": f,
-                    "injections_done": int(self._ram.injections_done),
-                    "generatorCount": int(self._ram.generatorCount),
-                    "cumulative_realized_usdt_after": round(self._ram.cumulative_realized_usdt, 8),
-                },
-            )
-            self._rearm_virtual_ladder(reason="profit_inject_compound", mode="qty_only")
-        _log.info(
-            "profit_injection hybrid=%s mode=%s count=%s max=%s qty_eff=%.8f",
-            self._hybrid_line_cap,
-            self._profit_injection_mode,
-            self._ram.generatorCount,
-            self._max_generator_count,
-            self._ram.order_quantity_effective,
-        )
+    def _upper_band_epsilon(self) -> float:
+        tick = float(self._filters.get("tick_size") or 0)
+        return max(tick * 0.5, 1e-12)
 
-    def _lift_eval_and_mutate_ram(self, price: float) -> bool:
+    def _is_price_above_generator_upper(self, price: float) -> bool:
+        return float(price) > float(self._ram.generatorUpper) + self._upper_band_epsilon()
+
+    def _upper_sell_lines_pending(self) -> int:
+        """Armed SELL virtual lines strictly above generatorUpper."""
+        if not self._virtual_book:
+            return 0
+        hi = float(self._ram.generatorUpper)
+        eps = self._upper_band_epsilon()
+        n = 0
+        for ln in self._virtual_book.lines.values():
+            if ln.side != Side.SELL or ln.triggered or not ln.armed:
+                continue
+            if ln.price > hi + eps:
+                n += 1
+        return n
+
+    def _should_auto_recenter_on_price(self, price: float) -> bool:
         if price < self._ram.generatorUpper + self._lift_above_offset:
             return False
-        band = self._ram.generatorUpper - self._ram.generatorLower
-        if band <= 0:
+        if self._upper_sell_armed_count > 0:
+            return (
+                self._upper_sell_lines_pending() == 0
+                and self._upper_sell_completed >= self._upper_sell_armed_count
+            )
+        return True
+
+    def _recenter_grid_on_pivot(self, pivot: float, *, reason: str) -> bool:
+        """Auto-shift: new pivot at current price, same band width and generatorCount."""
+        band = float(self._ram.generatorUpper) - float(self._ram.generatorLower)
+        if band <= 0 or pivot <= 0:
             return False
+        tick = float(self._filters.get("tick_size") or 0)
+        new_upper = quantize_price(float(pivot), tick) if tick else float(pivot)
+        new_lower = quantize_price(new_upper - band, tick) if tick else new_upper - band
+        if not (new_lower < new_upper):
+            return False
+        if abs(new_upper - self._ram.generatorUpper) < self._upper_band_epsilon() and abs(
+            new_lower - self._ram.generatorLower
+        ) < self._upper_band_epsilon():
+            return False
+
         old_upper = float(self._ram.generatorUpper)
         old_lower = float(self._ram.generatorLower)
-        new_upper = price
-        new_lower = new_upper - band
         self._ram.generatorUpper = new_upper
         self._ram.generatorLower = new_lower
         levels = self._rebuild_levels()
+        self._sync_line_trail_to_levels(levels)
         self._retarget_idle_tp_after_band_shift(levels)
+        self._upper_sell_armed_count = 0
+        self._upper_sell_completed = 0
+        self._asymmetric_shift_active = True
         self._audit(
             GRID_SHIFT,
             details={
+                "shift_reason": reason,
                 "generatorUpper_before": old_upper,
                 "generatorLower_before": old_lower,
                 "generatorUpper_after": float(new_upper),
                 "generatorLower_after": float(new_lower),
-                "lift_trigger_price": float(price),
-                "lift_above_offset": float(self._lift_above_offset),
+                "pivot_price": float(pivot),
                 "generatorCount": int(self._ram.generatorCount),
+                "upper_sell_completed": int(self._upper_sell_completed),
             },
         )
-        _log.info("grid_shift new_upper=%s new_lower=%s", new_upper, new_lower)
+        _log.info(
+            "auto_shift reason=%s new_upper=%s new_lower=%s",
+            reason,
+            new_upper,
+            new_lower,
+        )
         return True
+
+    def _lift_eval_and_mutate_ram(self, price: float) -> bool:
+        """Legacy name used in tests — delegates to auto-shift recenter."""
+        if price < self._ram.generatorUpper + self._lift_above_offset:
+            return False
+        return self._recenter_grid_on_pivot(price, reason="price_breakout")
+
+    async def _maybe_auto_shift_after_upper_sell(self, pivot: float) -> None:
+        if not self._running:
+            return
+        if self._upper_sell_lines_pending() > 0:
+            return
+        if self._upper_sell_armed_count > 0 and self._upper_sell_completed < self._upper_sell_armed_count:
+            return
+        if self._recenter_grid_on_pivot(pivot, reason="last_upper_sell_closed"):
+            await self._io_dynamic_lift()
 
     def _retarget_idle_tp_after_band_shift(self, levels: list[float]) -> None:
         """Shift upper/lower together; keep lock_profit / trailing peaks absolute (no reset)."""
@@ -669,12 +1065,66 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
             else:
                 st.tp_level = lv - self._ram.trailingOffset
 
+    def _line_has_confirmed_buy(self, line_index: int) -> bool:
+        return int(line_index) in self._lines_with_confirmed_buy
+
+    def _line_trail_allows_trailing(self, line_index: int, st: LineTrailState) -> bool:
+        return bool(st.exchange_fill_confirmed) and self._line_has_confirmed_buy(line_index)
+
+    def _reset_phantom_trail_state(self, line_index: int, st: LineTrailState) -> None:
+        """Force idle when this line has no session BUY fill (blocks mark-only trailing)."""
+        if self._line_trail_allows_trailing(line_index, st):
+            return
+        st.phase = LineTrailPhase.idle
+        st.trail_peak = 0.0
+        st.lock_floor = 0.0
+        st.trailing_audit_done = False
+        st.exchange_fill_confirmed = False
+
+    def _apply_exchange_fill_to_line_trail(self, line_index: int, side: Side) -> None:
+        st = self._ram.line_trail.get(line_index)
+        if st is None:
+            return
+        if self._first_side == Side.BUY:
+            if side == Side.BUY:
+                self._lines_with_confirmed_buy.add(int(line_index))
+                st.exchange_fill_confirmed = True
+                st.phase = LineTrailPhase.idle
+                st.trail_peak = 0.0
+                st.lock_floor = 0.0
+                st.trailing_audit_done = False
+            elif side == Side.SELL:
+                self._lines_with_confirmed_buy.discard(int(line_index))
+                st.exchange_fill_confirmed = False
+                st.phase = LineTrailPhase.idle
+                st.trail_peak = 0.0
+                st.lock_floor = 0.0
+                st.trailing_audit_done = False
+        else:
+            if side == Side.SELL:
+                self._lines_with_confirmed_buy.add(int(line_index))
+                st.exchange_fill_confirmed = True
+                st.phase = LineTrailPhase.idle
+                st.trail_peak = 0.0
+                st.lock_floor = 0.0
+                st.trailing_audit_done = False
+            elif side == Side.BUY:
+                self._lines_with_confirmed_buy.discard(int(line_index))
+                st.exchange_fill_confirmed = False
+                st.phase = LineTrailPhase.idle
+                st.trail_peak = 0.0
+                st.lock_floor = 0.0
+                st.trailing_audit_done = False
+
     def _trailing_eval(self, price: float) -> None:
         """
         TP touch: LockProfit (no immediate close). Next ticks: arm trailing stop at X% (``trailing_stop_pct``)
         off the momentum peak (``trail_peak`` ratchets with favorable movement).
         """
         for idx, st in self._ram.line_trail.items():
+            self._reset_phantom_trail_state(idx, st)
+            if not self._line_trail_allows_trailing(idx, st):
+                continue
             if st.phase == LineTrailPhase.idle:
                 if self._first_side == Side.BUY and price >= st.tp_level:
                     st.phase = LineTrailPhase.lock_profit
@@ -687,16 +1137,19 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
             elif st.phase == LineTrailPhase.lock_profit:
                 st.phase = LineTrailPhase.trailing
                 st.trail_peak = price
-                self._audit(
-                    TRAILING_STARTED,
-                    details={
-                        "line_index": int(idx),
-                        "trail_reference_price": float(st.lock_floor),
-                        "trailingOffset": float(self._ram.trailingOffset),
-                        "trail_peak_initial": float(price),
-                        "trailing_stop_pct": float(self._trailing_stop_pct),
-                    },
-                )
+                if not st.trailing_audit_done:
+                    st.trailing_audit_done = True
+                    self._audit(
+                        TRAILING_STARTED,
+                        details={
+                            "line_index": int(idx),
+                            "exchange_fill_confirmed": True,
+                            "trail_reference_price": float(st.lock_floor),
+                            "trailingOffset": float(self._ram.trailingOffset),
+                            "trail_peak_initial": float(price),
+                            "trailing_stop_pct": float(self._trailing_stop_pct),
+                        },
+                    )
                 _log.debug("line %s trailing armed peak=%s", idx, st.trail_peak)
             elif st.phase == LineTrailPhase.trailing:
                 if self._first_side == Side.BUY and price > st.trail_peak:
@@ -709,6 +1162,9 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
         fired: list[tuple[int, dict[str, Any]]] = []
         for idx, st in list(self._ram.line_trail.items()):
             if idx in self._line_exit_mutex:
+                continue
+            self._reset_phantom_trail_state(idx, st)
+            if not self._line_trail_allows_trailing(idx, st):
                 continue
             if st.phase != LineTrailPhase.trailing or st.trail_peak <= 0:
                 continue
@@ -726,6 +1182,8 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
                     st.phase = LineTrailPhase.idle
                     st.trail_peak = 0.0
                     st.lock_floor = 0.0
+                    st.trailing_audit_done = False
+                    st.exchange_fill_confirmed = False
             else:
                 thr = st.trail_peak * (1.0 + self._trailing_stop_pct)
                 if price > thr:
@@ -740,43 +1198,202 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
                     st.phase = LineTrailPhase.idle
                     st.trail_peak = 0.0
                     st.lock_floor = 0.0
+                    st.trailing_audit_done = False
+                    st.exchange_fill_confirmed = False
         return fired
 
     def _effective_order_qty(self) -> float:
         m = self._ram.lot_expansion_multiplier if self._ram.boundary_mode else 1.0
         return self._ram.order_quantity_effective * m
 
-    def _schedule_db_snapshot(self) -> None:
-        blob = json.dumps(
-            {
-                "strategy": self.name,
-                "symbol": self._symbol,
-                "generatorUpper": self._ram.generatorUpper,
-                "generatorLower": self._ram.generatorLower,
-                "generatorCount": self._ram.generatorCount,
-                "initialCapital": self._ram.initialCapital,
-                "trailingOffset": self._ram.trailingOffset,
-                "compoundingFactor": self._ram.compoundingFactor,
-                "last_price": self._ram.last_price,
-                "cumulative_realized_usdt": self._ram.cumulative_realized_usdt,
-                "profit_bank_usdt": self._ram.profit_bank_usdt,
-                "boundary_mode": self._ram.boundary_mode,
-                "lot_expansion_multiplier": self._ram.lot_expansion_multiplier,
-                "order_quantity_effective": self._ram.order_quantity_effective,
-                "injections_done": self._ram.injections_done,
-                "maxGeneratorCount": self._max_generator_count,
-                "hybridLineCap": self._hybrid_line_cap,
-                "virtualGrid": (
-                    self._virtual_book.to_snapshot_rows() if self._virtual_book else []
-                ),
-                "virtualExecutions": (
-                    int(self._virtual_book.executions) if self._virtual_book else 0
-                ),
-                "lineTrail": self.line_trail_snapshot(),
-                "dcaMode": self._dca_mode,
-            },
-            separators=(",", ":"),
+    def _filled_oid_retention_ms(self) -> int:
+        raw = (os.getenv("ALKARRAR_FILLED_OID_RETENTION_MS") or "").strip()
+        if raw:
+            try:
+                return max(60_000, int(raw))
+            except (TypeError, ValueError):
+                pass
+        return 48 * 3600 * 1000
+
+    def _record_filled_order_id(self, oid: str) -> bool:
+        """Return True if this orderId was not seen in the retention window."""
+        if not oid:
+            return True
+        now = int(time.time() * 1000)
+        prev = self._filled_order_ids.get(oid)
+        self._filled_order_ids[oid] = now
+        if prev is not None:
+            return False
+        return True
+
+    def _maybe_prune_stale_memory(self) -> None:
+        now_mono = time.monotonic()
+        if now_mono - self._last_memory_prune_mono < 60.0:
+            return
+        self._last_memory_prune_mono = now_mono
+        cutoff = int(time.time() * 1000) - self._filled_oid_retention_ms()
+        self._filled_order_ids = {k: v for k, v in self._filled_order_ids.items() if v >= cutoff}
+        cooldown_cutoff = time.monotonic() - 3600.0
+        self._line_ioc_cooldown_until = {
+            k: v for k, v in self._line_ioc_cooldown_until.items() if v >= cooldown_cutoff
+        }
+
+    def build_persist_payload(self, *, auto_resume: bool | None = None) -> dict[str, Any]:
+        resume_flag = self._running if auto_resume is None else bool(auto_resume)
+        return {
+            "snapshotVersion": 1,
+            "autoResume": resume_flag,
+            "binanceEnv": str(getattr(self, "_binance_env", "") or ""),
+            "credentialsFingerprint": str(getattr(self, "_credentials_fingerprint", "") or ""),
+            "strategy": self.name,
+            "symbol": self._symbol,
+            "sessionStartMs": int(self._session_start_ms_persisted or 0),
+            "gridSettings": dict(self._persisted_grid_settings),
+            "generatorUpper": self._ram.generatorUpper,
+            "generatorLower": self._ram.generatorLower,
+            "generatorCount": self._ram.generatorCount,
+            "initialCapital": self._ram.initialCapital,
+            "trailingOffset": self._ram.trailingOffset,
+            "compoundingFactor": self._ram.compoundingFactor,
+            "last_price": self._ram.last_price,
+            "cumulative_realized_usdt": self._ram.cumulative_realized_usdt,
+            "profit_bank_usdt": self._ram.profit_bank_usdt,
+            "boundary_mode": self._ram.boundary_mode,
+            "lot_expansion_multiplier": self._ram.lot_expansion_multiplier,
+            "order_quantity_effective": self._ram.order_quantity_effective,
+            "order_quantity_base": self._ram.order_quantity_base,
+            "injections_done": self._ram.injections_done,
+            "lastAvailableUsdt": self._last_available_usdt,
+            "profitInjectionMode": "compound_size",
+            "asymmetricShiftActive": bool(self._asymmetric_shift_active),
+            "upperSellArmedCount": int(self._upper_sell_armed_count),
+            "upperSellCompleted": int(self._upper_sell_completed),
+            "linesWithConfirmedBuy": sorted(int(x) for x in self._lines_with_confirmed_buy),
+            "filledOrderIds": dict(self._filled_order_ids),
+            "virtualGrid": (
+                self._virtual_book.to_snapshot_rows() if self._virtual_book else []
+            ),
+            "virtualExecutions": (
+                int(self._virtual_book.executions) if self._virtual_book else 0
+            ),
+            "lineTrail": self.line_trail_snapshot(),
+            "dcaMode": self._dca_mode,
+            "lift_above_offset": float(self._lift_above_offset),
+            "trailing_stop_pct": float(self._trailing_stop_pct),
+        }
+
+    def _restore_from_snapshot(self, snap: dict[str, Any]) -> None:
+        """Rebuild RAM + virtual ladder from last persisted state (no bootstrap MARKET)."""
+        if self._virtual_book is None:
+            self._virtual_book = VirtualGridBook.from_env(self._symbol)
+        vrows = snap.get("virtualGrid")
+        if isinstance(vrows, list) and vrows:
+            self._virtual_book.load_snapshot_rows(vrows)
+            self._virtual_book.executions = int(snap.get("virtualExecutions") or 0)
+
+        self._ram.cumulative_realized_usdt = float(snap.get("cumulative_realized_usdt") or 0)
+        self._ram.cumulative_realized_at_last_resize = float(
+            snap.get("cumulative_realized_at_last_resize") or self._ram.cumulative_realized_usdt
         )
+        self._ram.profit_bank_usdt = float(snap.get("profit_bank_usdt") or 0)
+        self._ram.boundary_mode = bool(snap.get("boundary_mode"))
+        self._ram.lot_expansion_multiplier = float(snap.get("lot_expansion_multiplier") or 1.0)
+        self._ram.order_quantity_effective = float(
+            snap.get("order_quantity_effective") or self._ram.order_quantity_effective
+        )
+        self._ram.order_quantity_base = float(
+            snap.get("order_quantity_base") or self._ram.order_quantity_base
+        )
+        self._ram.injections_done = int(snap.get("injections_done") or 0)
+        self._ram.last_price = float(snap.get("last_price") or 0)
+        self._last_available_usdt = float(snap.get("lastAvailableUsdt") or self._last_available_usdt)
+        self._asymmetric_shift_active = bool(snap.get("asymmetricShiftActive"))
+        self._upper_sell_armed_count = int(snap.get("upperSellArmedCount") or 0)
+        self._upper_sell_completed = int(snap.get("upperSellCompleted") or 0)
+        self._lines_with_confirmed_buy = set()
+        for x in snap.get("linesWithConfirmedBuy") or []:
+            try:
+                self._lines_with_confirmed_buy.add(int(x))
+            except (TypeError, ValueError):
+                continue
+        oid_map = snap.get("filledOrderIds")
+        if isinstance(oid_map, dict):
+            self._filled_order_ids = {str(k): int(v) for k, v in oid_map.items() if k}
+        elif isinstance(oid_map, list):
+            now = int(time.time() * 1000)
+            self._filled_order_ids = {str(o): now for o in oid_map if o}
+
+        for row in snap.get("lineTrail") or []:
+            if not isinstance(row, dict):
+                continue
+            idx = int(row.get("lineIndex", -1))
+            if idx < 0:
+                continue
+            phase_raw = str(row.get("phase", "idle"))
+            try:
+                phase = LineTrailPhase(phase_raw)
+            except ValueError:
+                phase = LineTrailPhase.idle
+            st = self._ram.line_trail.get(idx)
+            if st is None:
+                continue
+            st.phase = phase
+            st.tp_level = float(row.get("tpLevel") or st.tp_level)
+            st.trail_peak = float(row.get("trailPeak") or 0)
+            st.lock_floor = float(row.get("lockFloor") or 0)
+            st.exchange_fill_confirmed = bool(row.get("exchangeFillConfirmed"))
+            st.trailing_audit_done = phase == LineTrailPhase.trailing
+
+        if self._ram.last_price > 0:
+            self._prev_mark = float(self._ram.last_price)
+        _log.info(
+            "grid state restored symbol=%s virtual_lines=%s asymmetric=%s",
+            self._symbol,
+            len(self._virtual_book.lines) if self._virtual_book else 0,
+            self._asymmetric_shift_active,
+        )
+
+    async def _finalize_resume_after_restore(self) -> None:
+        if not self._running or not isinstance(self._exchange, BinanceSpotClient):
+            return
+        if self._virtual_book and not self._virtual_book.lines:
+            mark = float(self._ram.last_price or 0)
+            if mark <= 0:
+                try:
+                    tick = await self._exchange.fetch_ticker(self._symbol)
+                    for k in ("price", "lastPrice", "last"):
+                        try:
+                            mark = float(tick.get(k) or 0)
+                        except (TypeError, ValueError):
+                            mark = 0.0
+                        if mark > 0:
+                            break
+                except Exception:
+                    mark = 0.0
+            if mark > 0:
+                self._ram.last_price = mark
+                self._prev_mark = mark
+            self._rearm_virtual_ladder(
+                reason="resume_empty_book",
+                mode="full",
+                asymmetric_buys_only=bool(self._asymmetric_shift_active),
+            )
+        await self.persist_resume_snapshot(auto_resume=True)
+        self._audit(
+            "VIRTUAL_REARM",
+            details={"reason": "resume_after_crash", "context": "grid_auto_resume"},
+        )
+
+    async def persist_resume_snapshot(self, *, auto_resume: bool) -> None:
+        if not self._bot_id or not self._symbol:
+            return
+        from backend.api.grid_snapshot_store import write_snapshot_payload
+
+        payload = self.build_persist_payload(auto_resume=auto_resume)
+        await write_snapshot_payload(self._bot_id, self._symbol, payload)
+
+    def _schedule_db_snapshot(self) -> None:
+        blob = json.dumps(self.build_persist_payload(), separators=(",", ":"))
         try:
             self._db_queue.put_nowait(blob)
         except asyncio.QueueFull:
@@ -965,7 +1582,38 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
 
         reserve_total_exact = buy_quote_exact + reserve_market_quote
         wallet_usdt_dec = Decimal(str(free_usdt_f))
-        ic_cap = Decimal(str(self._ram.initialCapital))
+        deploy_dec = Decimal(str(max(self.effective_deploy_usdt(), 0.0)))
+
+        if deploy_dec > 0 and reserve_total_exact > deploy_dec:
+            if sell_levels and buy_quote_exact <= deploy_dec:
+                self._audit(
+                    "VIRTUAL_GRID_ARMED",
+                    details={
+                        "context": "bootstrap_defer_sell_ladder_within_deploy",
+                        "required_quote_exact": str(reserve_total_exact),
+                        "deploy_cap": str(deploy_dec),
+                        "sell_rungs_deferred": len(plan_sells),
+                    },
+                )
+                plan_sells = []
+                sell_levels = []
+                market_qty_str = None
+                reserve_market_quote = Decimal(0)
+                reserve_total_exact = buy_quote_exact
+                self._asymmetric_shift_active = True
+            else:
+                self._audit(
+                    SYSTEM_ERROR,
+                    details={
+                        "context": "bootstrap_abort_deploy_insufficient",
+                        "required_quote_exact": str(reserve_total_exact),
+                        "deploy_cap": str(deploy_dec),
+                        "buy_quote_exact": str(buy_quote_exact),
+                        "market_quote_exact": str(reserve_market_quote),
+                    },
+                )
+                _log.warning("bootstrap abort: exceeds ring-fenced deploy")
+                return
 
         if reserve_total_exact > wallet_usdt_dec:
             self._audit(
@@ -974,6 +1622,7 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
                     "context": "bootstrap_abort_wallet_insufficient",
                     "required_quote_exact": str(reserve_total_exact),
                     "free_usdt": str(wallet_usdt_dec),
+                    "deploy_cap": str(deploy_dec),
                     "buy_quote_exact": str(buy_quote_exact),
                     "market_quote_exact": str(reserve_market_quote),
                     "sell_base_need_exact": str(sell_base_need),
@@ -982,21 +1631,44 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
             _log.warning("bootstrap abort: wallet USDT insufficient (exact)")
             return
 
-        if reserve_total_exact > ic_cap:
+        bootstrap_market = _bootstrap_market_buy_enabled()
+        if sell_levels and not bootstrap_market:
             self._audit(
-                SYSTEM_ERROR,
+                "VIRTUAL_GRID_ARMED",
                 details={
-                    "context": "bootstrap_abort_initial_capital_exceeded",
-                    "required_quote_exact": str(reserve_total_exact),
-                    "initialCapital": str(ic_cap),
-                    "buy_quote_exact": str(buy_quote_exact),
-                    "market_quote_exact": str(reserve_market_quote),
+                    "context": "bootstrap_market_disabled_virtual_only",
+                    "sell_rungs_deferred": len(plan_sells),
                 },
             )
-            _log.warning("bootstrap abort: initialCapital ceiling exceeded")
-            return
+            plan_sells = []
+            sell_levels = []
+            market_qty_str = None
+            reserve_market_quote = Decimal(0)
+            self._asymmetric_shift_active = True
+        elif (
+            sell_levels
+            and market_qty_str
+            and deploy_dec > 0
+            and reserve_market_quote > deploy_dec * _bootstrap_market_max_quote_fraction()
+            and buy_quote_exact <= deploy_dec
+        ):
+            self._audit(
+                "VIRTUAL_GRID_ARMED",
+                details={
+                    "context": "bootstrap_defer_market_buy_cap",
+                    "market_quote_would_be": str(reserve_market_quote),
+                    "deploy_cap": str(deploy_dec),
+                    "max_frac": str(_bootstrap_market_max_quote_fraction()),
+                    "sell_rungs_deferred": len(plan_sells),
+                },
+            )
+            plan_sells = []
+            sell_levels = []
+            market_qty_str = None
+            reserve_market_quote = Decimal(0)
+            self._asymmetric_shift_active = True
 
-        if sell_levels and mark > 0 and market_qty_str:
+        if sell_levels and mark > 0 and market_qty_str and not self._asymmetric_shift_active and bootstrap_market:
             qty_market_final_s = market_qty_str
             try:
                 res = await self._exchange.create_order(
@@ -1005,6 +1677,45 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
                     order_type="MARKET",
                     quantity=qty_market_final_s,
                 )
+                if not spot_order_filled(res):
+                    self._audit(
+                        SYSTEM_ERROR,
+                        details={
+                            "context": "bootstrap_market_buy_not_filled",
+                            "order_status": str(res.get("status") or ""),
+                            "executedQty": str(res.get("executedQty") or ""),
+                            "orderId": res.get("orderId"),
+                        },
+                    )
+                    _log.error("bootstrap: MARKET BUY not FILLED on exchange")
+                    return
+                self._apply_session_inventory_delta(Side.BUY, res)
+                try:
+                    from backend.api.grid_live_ledger import (
+                        fill_price_from_order_response,
+                        log_grid_order_fill,
+                    )
+
+                    fill_px = fill_price_from_order_response(res, mark)
+                    log_grid_order_fill(
+                        self,
+                        side="BUY",
+                        order_id=res.get("orderId"),
+                        target_price=mark,
+                        fill_price=fill_px,
+                        quantity=float(res.get("executedQty") or qty_market_final_s),
+                        context="bootstrap_market_buy",
+                    )
+                except Exception:
+                    _log.debug("bootstrap ledger log skipped", exc_info=True)
+                if self._virtual_book:
+                    self._virtual_book.executions += 1
+                cb = getattr(self, "_on_exchange_fill_cb", None)
+                if callable(cb):
+                    try:
+                        await cb(Side.BUY, res)
+                    except Exception:
+                        _log.debug("bootstrap ledger hook failed", exc_info=True)
                 try:
                     from backend.api.grid_manager import grid_manager
 
@@ -1021,7 +1732,7 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
                                 "price": mark,
                                 "quantity": qty_market_final_s,
                                 "orderId": res.get("orderId"),
-                                "status": str(res.get("status", "") or "FILLED"),
+                                "status": str(res.get("status", "") or ""),
                                 "order_type": "MARKET",
                                 "bootstrap": True,
                             },
@@ -1091,7 +1802,13 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
                 _log.exception("bootstrap market buy failed")
                 return
 
-        await self._arm_virtual_plan(plan_sells, Side.SELL, qty_eff)
+        if self._asymmetric_shift_active:
+            plan_sells = []
+        upper_sell_rows = [(idx, px) for idx, px, _, _ in plan_sells if self._is_price_above_generator_upper(px)]
+        self._upper_sell_armed_count = len(upper_sell_rows)
+        self._upper_sell_completed = 0
+        if plan_sells:
+            await self._arm_virtual_plan(plan_sells, Side.SELL, qty_eff)
         await self._arm_virtual_plan(plan_buys, Side.BUY, qty_eff)
 
     async def _arm_virtual_plan(
@@ -1125,14 +1842,11 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
                 grid_manager.note_order_placed(self._symbol)
             except Exception:
                 pass
-        self._audit(
-            "VIRTUAL_GRID_ARMED",
-            details={
-                "side": side.value.upper(),
-                "lines": len(plan),
-                "qty_per_line": float(qty_eff),
-                "armed_total": self._virtual_book.armed_count(),
-            },
+        _log.debug(
+            "virtual grid armed side=%s lines=%s total=%s",
+            side.value.upper(),
+            len(plan),
+            self._virtual_book.armed_count(),
         )
 
     def _virtual_crossed(self, prev_mark: float, mark: float) -> list[VirtualGridLine]:
@@ -1147,10 +1861,25 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
             or not self._virtual_book
         ):
             return
-        if line.triggered or not line.armed or line.line_index in self._line_exit_mutex:
+        if line.line_index in self._line_exit_mutex:
             return
+        cooldown_until = self._line_ioc_cooldown_until.get(line.line_index, 0.0)
+        if time.monotonic() < cooldown_until:
+            line.triggered = False
+            line.armed = True
+            return
+        if line.triggered:
+            return
+        if line.line_index not in self._line_fill_mutex:
+            if not line.armed:
+                return
+            self._line_fill_mutex.add(line.line_index)
+            line.armed = False
         if not self._virtual_book.throttle.allow():
             _log.debug("virtual grid throttle skip line=%s", line.line_index)
+            self._line_fill_mutex.discard(line.line_index)
+            line.triggered = False
+            line.armed = True
             return
         if not self._virtual_book.slippage_ok(line, mark):
             self._audit(
@@ -1163,14 +1892,31 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
                     "max_slippage_pct": self._virtual_book.max_slippage_pct,
                 },
             )
+            self._line_fill_mutex.discard(line.line_index)
+            line.triggered = False
+            line.armed = True
             return
-        line.triggered = True
-        line.armed = False
         side_u = line.side.value.upper()
+        qty_fill = self._qty_for_virtual_line(line, mark=mark)
+        if line.side == Side.SELL:
+            qty_fill = self._cap_sell_to_session_inventory(qty_fill)
+            if qty_fill <= 0:
+                line.triggered = False
+                line.armed = True
+                self._line_fill_mutex.discard(line.line_index)
+                self._audit(
+                    SYSTEM_ERROR,
+                    details={
+                        "context": "virtual_grid_sell_no_session_inventory",
+                        "line_index": line.line_index,
+                        "session_base_inventory": float(self._session_base_inventory),
+                    },
+                )
+                return
         try:
             res = await self._spot_execute(
                 side=line.side,
-                qty=self._effective_order_qty(),
+                qty=qty_fill,
                 limit_price=line.price,
                 context="virtual_grid_fill",
                 audit_type="VIRTUAL_GRID_FILL",
@@ -1180,11 +1926,41 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
                     "mark": float(mark),
                 },
             )
-            if res is None:
+            if res is None or not spot_order_filled(res):
                 line.triggered = False
                 line.armed = True
+                self._line_fill_mutex.discard(line.line_index)
+                if res is not None:
+                    self._line_ioc_cooldown_until[line.line_index] = time.monotonic() + 8.0
+                    _log.debug(
+                        "virtual grid IOC miss line=%s status=%s",
+                        line.line_index,
+                        res.get("status"),
+                    )
                 return
-            self._virtual_book.executions += 1
+            line.triggered = True
+            self._apply_session_inventory_delta(line.side, res)
+            self._apply_exchange_fill_to_line_trail(line.line_index, line.side)
+            cb = getattr(self, "_on_exchange_fill_cb", None)
+            if callable(cb):
+                try:
+                    await cb(line.side, res)
+                except Exception:
+                    _log.debug("post-fill ledger hook failed", exc_info=True)
+            oid = str(res.get("orderId") or "")
+            if oid:
+                if self._record_filled_order_id(oid):
+                    self._virtual_book.executions += 1
+            else:
+                self._virtual_book.executions += 1
+            if line.side == Side.BUY:
+                self._maybe_arm_paired_sell_after_buy(line.line_index)
+            if line.side == Side.SELL and self._is_price_above_generator_upper(line.price):
+                self._upper_sell_completed += 1
+                asyncio.create_task(
+                    self._maybe_auto_shift_after_upper_sell(float(mark)),
+                    name="auto-shift-upper-sell",
+                )
             try:
                 from backend.api.grid_manager import grid_manager
 
@@ -1223,6 +1999,8 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
                     "error": str(exc)[:4096],
                 },
             )
+        finally:
+            self._line_fill_mutex.discard(line.line_index)
 
     async def _io_dynamic_lift(self) -> None:
         """After band lift: disarm stale lower virtual lines and re-arm ladder at new band."""
@@ -1233,7 +2011,20 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
             hi = self._ram.generatorUpper
             span = max(hi - lo, 1e-12)
             self._virtual_book.disarm_bucket("lower", lo=lo, hi=hi, span=span)
-            self._rearm_virtual_ladder(reason="grid_lift", mode="full")
+            mark = float(self._ram.last_price or hi)
+            _, sell_rows = self._classify_levels_by_mark(
+                mark,
+                buys_only_strict_below=True,
+            )
+            self._upper_sell_armed_count = sum(
+                1 for _idx, px in sell_rows if self._is_price_above_generator_upper(px)
+            )
+            self._upper_sell_completed = 0
+            self._rearm_virtual_ladder(
+                reason="grid_lift",
+                mode="full",
+                asymmetric_buys_only=True,
+            )
         else:
             for oid in list(self._ram.open_orders_lower):
                 asyncio.create_task(self._safe_cancel(oid), name=f"cx-{oid}")
@@ -1252,6 +2043,25 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
         """Grid/trail execution: LIMIT+IOC by default (exact price); MARKET only if env overrides."""
         if not isinstance(self._exchange, BinanceSpotClient):
             return None
+        if self._asymmetric_shift_active and side == Side.BUY:
+            style_probe = (
+                self._virtual_book.order_style
+                if self._virtual_book
+                else grid_exec_settings()["order_style"]
+            )
+            if style_probe != ExecOrderStyle.LIMIT_IOC:
+                _log.warning(
+                    "blocked MARKET BUY during asymmetric auto-shift context=%s",
+                    context,
+                )
+                self._audit(
+                    SYSTEM_ERROR,
+                    details={
+                        "context": "asymmetric_shift_market_buy_blocked",
+                        "spot_context": context,
+                    },
+                )
+                return None
         style = (
             self._virtual_book.order_style
             if self._virtual_book
@@ -1262,51 +2072,132 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
             px = float(self._ram.last_price or self._ram.generatorUpper)
         price_s, qty_s = self._normalize_order(px, qty)
         side_u = side.value.upper()
-        if style == ExecOrderStyle.LIMIT_IOC:
-            res = await self._exchange.create_order(
-                symbol=self._symbol,
-                side=side_u,
-                order_type="LIMIT",
-                quantity=qty_s,
-                price=price_s,
-                time_in_force="IOC",
+        target_px = float(price_s) if style == ExecOrderStyle.LIMIT_IOC else px
+        try:
+            if style == ExecOrderStyle.LIMIT_IOC:
+                res = await self._exchange.create_order(
+                    symbol=self._symbol,
+                    side=side_u,
+                    order_type="LIMIT",
+                    quantity=qty_s,
+                    price=price_s,
+                    time_in_force="IOC",
+                )
+            else:
+                res = await self._exchange.create_order(
+                    symbol=self._symbol,
+                    side=side_u,
+                    order_type="MARKET",
+                    quantity=qty_s,
+                )
+        except Exception as exc:
+            from backend.api.grid_live_ledger import log_grid_ledger, parse_binance_api_error
+
+            code, msg = parse_binance_api_error(exc)
+            log_grid_ledger(
+                self,
+                action_type="API_FAILURE",
+                trigger_reason=f"رفض أمر {side_u} ({context})",
+                target_price=target_px,
+                quantity=float(qty_s),
+                api_error_code=code,
+                api_error_message=msg,
+                extra={"context": context, **(audit_extra or {})},
             )
-        else:
-            res = await self._exchange.create_order(
-                symbol=self._symbol,
-                side=side_u,
-                order_type="MARKET",
-                quantity=qty_s,
+            raise
+        if not spot_order_filled(res):
+            _log.debug(
+                "spot order not filled context=%s status=%s side=%s",
+                context,
+                res.get("status"),
+                side_u,
             )
-        est_quote = float(qty_s) * float(price_s if style == ExecOrderStyle.LIMIT_IOC else px)
-        self._audit(
-            audit_type,
-            details={
-                **(audit_extra or {}),
-                "context": context,
-                "orderId": res.get("orderId"),
-                "side": side_u,
-                "quantity": str(qty_s),
-                "limit_price": float(price_s) if style == ExecOrderStyle.LIMIT_IOC else None,
-                "mark_at_order": float(self._ram.last_price or 0.0),
-                "order_style": style.value,
-                "estimated_gross_quote_usdt": round(est_quote, 8),
-            },
-        )
+            return res
+
+        fill_px = target_px
+        try:
+            from backend.api.grid_live_ledger import fill_price_from_order_response
+
+            fill_px = fill_price_from_order_response(res, target_px)
+        except Exception:
+            pass
+        exec_qty = qty_s
+        try:
+            eq = float(res.get("executedQty") or 0)
+            if eq > 0:
+                exec_qty = str(eq)
+        except (TypeError, ValueError):
+            pass
+        est_quote = float(exec_qty) * float(fill_px) if float(exec_qty) > 0 else 0.0
+        audit_details = {
+            **(audit_extra or {}),
+            "context": context,
+            "orderId": res.get("orderId"),
+            "side": side_u,
+            "quantity": str(exec_qty),
+            "executedQty": str(exec_qty),
+            "fill_price": float(fill_px),
+            "line_price": float(target_px),
+            "limit_price": float(price_s) if style == ExecOrderStyle.LIMIT_IOC else None,
+            "mark_at_order": float(self._ram.last_price or 0.0),
+            "order_style": style.value,
+            "order_status": str(res.get("status") or "FILLED"),
+            "estimated_gross_quote_usdt": round(est_quote, 8),
+        }
+        self._audit(audit_type, details=audit_details)
+        try:
+            from backend.api.grid_live_ledger import log_grid_order_fill
+
+            log_grid_order_fill(
+                self,
+                side=side_u,
+                order_id=res.get("orderId"),
+                target_price=float(target_px),
+                fill_price=float(fill_px),
+                quantity=float(exec_qty),
+                context=context,
+                audit_extra=audit_details,
+            )
+        except Exception:
+            _log.debug("grid ledger order fill log skipped", exc_info=True)
         return res
 
     async def _exit_line_market(self, line_idx: int, exit_snap: dict[str, Any] | None = None) -> None:
         if not isinstance(self._exchange, BinanceSpotClient):
             return
+        st = self._ram.line_trail.get(line_idx)
+        if st is None or not self._line_trail_allows_trailing(line_idx, st):
+            return
         self._line_exit_mutex.add(line_idx)
-        qty = self._effective_order_qty()
+        mark = float(self._ram.last_price or 0.0)
         side = Side.SELL if self._first_side == Side.BUY else Side.BUY
+        qty = self._effective_order_qty()
+        if self._virtual_book:
+            vln = self._virtual_book.lines.get(line_idx)
+            if vln is not None:
+                qty = self._qty_for_virtual_line(vln, mark=mark or vln.price)
+        if side == Side.SELL:
+            qty = self._cap_sell_to_session_inventory(qty)
+            if qty <= 0:
+                self._audit(
+                    SYSTEM_ERROR,
+                    details={
+                        "context": "trail_exit_no_session_inventory",
+                        "line_index": line_idx,
+                        "session_base_inventory": float(self._session_base_inventory),
+                    },
+                )
+                return
+        levels = self._rebuild_levels()
+        if 0 <= line_idx < len(levels):
+            ref_px = float(levels[line_idx])
+            qty = self._cap_qty_to_line_budget(ref_px, qty, mark=mark or ref_px)
         snap = dict(exit_snap or {})
         try:
             exit_px = float(snap.get("stop_threshold_price") or 0.0)
             if exit_px <= 0:
-                exit_px = float(snap.get("trail_peak") or self._ram.last_price or 0.0)
-            await self._spot_execute(
+                exit_px = float(snap.get("trail_peak") or mark or 0.0)
+            res = await self._spot_execute(
                 side=side,
                 qty=qty,
                 limit_price=exit_px,
@@ -1318,6 +2209,15 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
                     "note": "LIMIT_IOC at stop threshold when ALKARRAR_GRID_EXEC_ORDER_TYPE=LIMIT_IOC (default).",
                 },
             )
+            if res is not None and spot_order_filled(res):
+                self._apply_session_inventory_delta(side, res)
+                self._apply_exchange_fill_to_line_trail(line_idx, side)
+                cb = getattr(self, "_on_exchange_fill_cb", None)
+                if callable(cb):
+                    try:
+                        await cb(side, res)
+                    except Exception:
+                        _log.debug("trail exit ledger hook failed", exc_info=True)
         except Exception as exc:
             _log.exception("trail exit failed line=%s", line_idx)
             self._audit(
@@ -1415,6 +2315,19 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
                     await db.commit()
             except Exception:
                 _log.exception("shifting_grid db write failed")
+
+
+def _compound_resize_pct_from_env(settings: dict[str, Any] | None = None) -> float:
+    raw = ""
+    if settings and settings.get("compound_resize_pct") is not None:
+        raw = str(settings.get("compound_resize_pct"))
+    if not raw.strip():
+        raw = (os.getenv("ALKARRAR_COMPOUND_RESIZE_PCT") or "0.01").strip()
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        v = 0.01
+    return max(0.0, min(v, 1.0))
 
 
 def _price_from_market(market: dict[str, Any]) -> float:

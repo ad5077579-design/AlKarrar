@@ -107,6 +107,8 @@ async def invalidate_spot_client() -> None:
 
 
 async def reset_pool_after_credentials_change() -> None:
+    from backend.core.binance_key_probe import reset_binance_env_probe_cache
 
+    reset_binance_env_probe_cache()
     await invalidate_spot_client()
 

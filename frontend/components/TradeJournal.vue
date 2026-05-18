@@ -2,10 +2,13 @@
 import { computed, onMounted, onBeforeUnmount, ref, watch } from "vue"
 import { useBotStore } from "~/stores/bot"
 import {
-  fifoRealizedUsdt,
+  buildFifoPnlState,
+  fifoUnrealizedUsdt,
   gridSessionFills,
+  rowFifoPnlDisplay,
   summarizeGridSessionFills,
 } from "~/utils/fifoSpotPnl"
+import { tradesForDisplay, uniqueOrderCount } from "~/utils/tradeDisplay"
 
 const props = withDefaults(
   defineProps<{
@@ -57,6 +60,8 @@ const filtered = computed(() => {
   })
 })
 
+const displayRows = computed(() => tradesForDisplay(filtered.value))
+
 const summary = computed(() => {
   if (props.since?.trim()) {
     return summarizeGridSessionFills(sessionRows.value)
@@ -64,9 +69,23 @@ const summary = computed(() => {
   return props.symbol ? pack.value.summary : store.tradesSummary
 })
 
+const journalMark = computed(() => store.symbolMark(journalSym.value))
+
+const fifoState = computed(() => buildFifoPnlState(sessionRows.value, props.since))
+
 const closedFifoPnl = computed(() =>
-  props.since?.trim() ? fifoRealizedUsdt(sessionRows.value) : summary.value.totalRealizedPnl,
+  props.since?.trim() ? fifoState.value.realizedClosed : summary.value.totalRealizedPnl,
 )
+
+const floatingPnl = computed(() => fifoUnrealizedUsdt(fifoState.value, journalMark.value))
+
+const totalSessionPnl = computed(() => closedFifoPnl.value + floatingPnl.value)
+
+const platformOrderCount = computed(() => uniqueOrderCount(sessionRows.value))
+
+function rowPnl(row: (typeof sessionRows.value)[0]) {
+  return rowFifoPnlDisplay(row, fifoState.value, journalMark.value)
+}
 const journalLoading = computed(() => (props.symbol ? pack.value.loading : store.tradesLoading))
 const journalError = computed(() => (props.symbol ? pack.value.error : store.tradesError))
 const journalSyncError = computed(() =>
@@ -170,7 +189,7 @@ onMounted(() => {
     } else {
       void store.fetchTrades({ quiet: true })
     }
-  }, 60_000)
+  }, props.since ? 15_000 : 60_000)
 })
 
 onBeforeUnmount(() => {
@@ -229,8 +248,13 @@ onBeforeUnmount(() => {
 
     <div class="summary-row">
       <div class="summary-card">
-        <span class="summary-label">{{ since ? "تنفيذات" : "صفقات" }}</span>
-        <span class="summary-value">{{ summary.count }}</span>
+        <span class="summary-label">{{ since ? "fills / أوامر" : "صفقات" }}</span>
+        <span class="summary-value">
+          {{ summary.count }}
+          <span v-if="since && platformOrderCount < summary.count" class="order-hint muted">
+            · {{ platformOrderCount }} أمر على المنصة
+          </span>
+        </span>
       </div>
       <div class="summary-card">
         <span class="summary-label">شراء / بيع</span>
@@ -245,9 +269,29 @@ onBeforeUnmount(() => {
         <span class="summary-value">{{ formatNum(summary.totalQuoteVolume, 2) }}</span>
       </div>
       <div class="summary-card" :class="pnlClass(closedFifoPnl)">
-        <span class="summary-label">{{ since ? "ربح مغلق" : "ربح محقق" }}</span>
+        <span class="summary-label">ربح مغلق</span>
         <span class="summary-value">
           {{ closedFifoPnl >= 0 ? "+" : "" }}{{ formatNum(closedFifoPnl, 4) }}
+        </span>
+      </div>
+      <div
+        v-if="since || fifoState.openLots.length"
+        class="summary-card"
+        :class="pnlClass(floatingPnl)"
+      >
+        <span class="summary-label">ربح عائم (Mark)</span>
+        <span class="summary-value">
+          {{ floatingPnl >= 0 ? "+" : "" }}{{ formatNum(floatingPnl, 4) }}
+        </span>
+      </div>
+      <div
+        v-if="since || fifoState.openLots.length"
+        class="summary-card"
+        :class="pnlClass(totalSessionPnl)"
+      >
+        <span class="summary-label">الإجمالي</span>
+        <span class="summary-value">
+          {{ totalSessionPnl >= 0 ? "+" : "" }}{{ formatNum(totalSessionPnl, 4) }}
         </span>
       </div>
       <div class="summary-card">
@@ -255,6 +299,14 @@ onBeforeUnmount(() => {
         <span class="summary-value">{{ formatNum(summary.totalCommission, 4) }}</span>
       </div>
     </div>
+    <p
+      v-if="since && summary.count > 0 && platformOrderCount < summary.count"
+      class="fills-note muted"
+      role="note"
+    >
+      عدة صفوف بنفس رقم الأمر = أمر واحد على Binance (عدة fills). المجموع
+      {{ formatNum(summary.totalQuoteVolume, 2) }} USDT يطابق عمود «المجموع» في المنصة.
+    </p>
 
     <div class="toolbar">
       <div class="filters" role="tablist">
@@ -309,14 +361,14 @@ onBeforeUnmount(() => {
             <th>السعر</th>
             <th>الكمية</th>
             <th>القيمة</th>
-            <th>ربح محقق</th>
+            <th>ربح الصفقة</th>
             <th>عمولة</th>
             <th>النوع</th>
             <th>رقم الأمر</th>
           </tr>
         </thead>
         <tbody>
-          <tr v-for="row in filtered" :key="row.exchangeTradeId">
+          <tr v-for="row in displayRows" :key="row.exchangeTradeId">
             <td class="col-time">{{ formatTime(row.tradedAt, row.tradedAtMs) }}</td>
             <td class="col-sym">{{ row.symbol }}</td>
             <td>
@@ -327,8 +379,15 @@ onBeforeUnmount(() => {
             <td class="num">{{ formatPrice(row.price) }}</td>
             <td class="num">{{ formatNum(row.quantity, 6) }}</td>
             <td class="num">{{ formatNum(row.quoteQty, 2) }}</td>
-            <td class="num" :class="pnlClass(row.realizedPnl)">
-              {{ row.realizedPnl >= 0 ? "+" : "" }}{{ formatNum(row.realizedPnl, 4) }}
+            <td
+              class="num"
+              :class="[
+                pnlClass(rowPnl(row).value ?? 0),
+                rowPnl(row).mode === 'floating' ? 'pnl-float' : '',
+              ]"
+            >
+              <span v-if="rowPnl(row).mode === 'floating'" class="float-tag">عائم</span>
+              {{ rowPnl(row).text }}
             </td>
             <td class="num muted">
               {{ formatNum(row.commission, 4) }}
@@ -337,7 +396,10 @@ onBeforeUnmount(() => {
             <td>
               <span class="role-pill">{{ row.isMaker ? "Maker" : "Taker" }}</span>
             </td>
-            <td class="col-id" :title="row.orderId">{{ row.orderId }}</td>
+            <td class="col-id" :title="row.orderId">
+              {{ row.orderId }}
+              <span v-if="row.isMultiFill" class="fill-tag">fill {{ row.fillIndex }}/{{ row.fillCount }}</span>
+            </td>
           </tr>
         </tbody>
       </table>
@@ -571,6 +633,17 @@ button.btn-close:hover {
 .num.neg {
   color: var(--danger);
 }
+.num.pnl-float {
+  color: var(--warn, #e6b84d);
+}
+.float-tag {
+  display: inline-block;
+  margin-inline-end: 0.25rem;
+  font-size: 0.62rem;
+  font-weight: 700;
+  color: var(--warn, #e6b84d);
+  vertical-align: middle;
+}
 .side-pill {
   display: inline-block;
   padding: 0.15rem 0.45rem;
@@ -602,6 +675,21 @@ button.btn-close:hover {
   text-align: center;
   border: 1px dashed var(--border);
   border-radius: 10px;
+}
+.fills-note {
+  margin: 0.35rem 0 0.75rem;
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+.order-hint {
+  font-size: 0.78rem;
+  font-weight: 500;
+}
+.fill-tag {
+  display: block;
+  font-size: 0.65rem;
+  color: var(--warn, #e6b84d);
+  margin-top: 0.15rem;
 }
 .footer-meta {
   margin: 0;

@@ -38,6 +38,12 @@ async function onPick(row: MarketSymbol) {
   selecting.value = row.symbol
   try {
     await store.selectSymbol(row.symbol)
+  } catch (e) {
+    const msg =
+      e && typeof e === "object" && "data" in e && (e as { data?: { detail?: string } }).data?.detail
+        ? String((e as { data?: { detail?: string } }).data?.detail)
+        : String(e)
+    alert(msg || "تعذّر تغيير العملة")
   } finally {
     selecting.value = null
   }

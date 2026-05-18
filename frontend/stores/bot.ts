@@ -14,6 +14,16 @@ type WsMsg =
       symbol?: string
       data: Record<string, unknown>
     }
+  | {
+      type: "grid_ledger"
+      symbol?: string
+      cleared?: boolean
+      frozen?: boolean
+      freezeReason?: string
+      entry?: Record<string, unknown>
+      count?: number
+      entries?: Record<string, unknown>[]
+    }
   | { type: "emergency"; bot_id?: string; ts?: string }
 
 function num(v: unknown, fallback = 0): number {
@@ -49,6 +59,7 @@ export type TradeRow = {
 
 export type TradesSummary = {
   count: number
+  uniqueOrderCount?: number
   buyCount: number
   sellCount: number
   totalQuoteVolume: number
@@ -72,6 +83,8 @@ export type GridLineTrailRow = {
   tpLevel?: number
   trailPeak?: number
   lockFloor?: number
+  exchangeFillConfirmed?: boolean
+  hasSessionBuy?: boolean
 }
 
 export type GridSymbolMeta = {
@@ -83,11 +96,19 @@ export type GridSymbolMeta = {
   running?: boolean
   sessionRealizedUsdt?: number
   cumulativeRealizedUsdt?: number
+  allocatedCapital?: number
+  deployCapitalUsdt?: number
+  gridEquityUsdt?: number
+  unrealizedPnlUsdt?: number
+  peakEquityUsdt?: number
+  currentDrawdownPct?: number
+  trailingEquityStopTriggered?: boolean
   lineTrail?: GridLineTrailRow[]
 }
 
 const EMPTY_TRADES_SUMMARY: TradesSummary = {
   count: 0,
+  uniqueOrderCount: 0,
   buyCount: 0,
   sellCount: 0,
   totalQuoteVolume: 0,
@@ -114,6 +135,88 @@ export type AuditLogRow = {
   markPrice: number
   realizedUsdt: number
   details: Record<string, unknown>
+}
+
+export type GridLedgerEntry = {
+  id: string
+  timestampMs: number
+  actionType: string
+  triggerReason: string
+  symbol: string
+  targetPrice: number | null
+  fillPrice: number | null
+  slippagePct: number | null
+  quantity: number | null
+  netProfitUsdt: number | null
+  commissionUsdt: number | null
+  generatorUpper: number
+  generatorLower: number
+  generatorCount: number
+  orderSize: number
+  markPrice: number
+  apiErrorCode: string | null
+  apiErrorMessage: string | null
+  extra: Record<string, unknown>
+}
+
+export type GridLedgerPack = {
+  symbol: string
+  frozen: boolean
+  freezeReason: string
+  entries: GridLedgerEntry[]
+}
+
+function ledgerEntryKey(row: GridLedgerEntry): string {
+  const oid = row.extra?.orderId
+  if (oid != null && String(oid).length > 0) {
+    return `${row.actionType}:${String(oid)}`
+  }
+  return row.id
+}
+
+function mergeLedgerEntries(existing: GridLedgerEntry[], incoming: GridLedgerEntry[]): GridLedgerEntry[] {
+  const byKey = new Map<string, GridLedgerEntry>()
+  for (const row of existing) {
+    byKey.set(ledgerEntryKey(row), row)
+  }
+  for (const row of incoming) {
+    byKey.set(ledgerEntryKey(row), row)
+  }
+  return [...byKey.values()].sort((a, b) => a.timestampMs - b.timestampMs)
+}
+
+function parseGridLedgerEntry(raw: Record<string, unknown>): GridLedgerEntry | null {
+  const id = String(raw.id ?? "")
+  if (!id) return null
+  const nul = (v: unknown): number | null => {
+    if (v == null || v === "") return null
+    const n = num(v, NaN)
+    return Number.isFinite(n) ? n : null
+  }
+  return {
+    id,
+    timestampMs: num(raw.timestampMs),
+    actionType: String(raw.actionType ?? ""),
+    triggerReason: String(raw.triggerReason ?? ""),
+    symbol: String(raw.symbol ?? "").toUpperCase(),
+    targetPrice: nul(raw.targetPrice),
+    fillPrice: nul(raw.fillPrice),
+    slippagePct: nul(raw.slippagePct),
+    quantity: nul(raw.quantity),
+    netProfitUsdt: nul(raw.netProfitUsdt),
+    commissionUsdt: nul(raw.commissionUsdt),
+    generatorUpper: num(raw.generatorUpper),
+    generatorLower: num(raw.generatorLower),
+    generatorCount: Math.floor(num(raw.generatorCount)),
+    orderSize: num(raw.orderSize),
+    markPrice: num(raw.markPrice),
+    apiErrorCode: raw.apiErrorCode != null ? String(raw.apiErrorCode) : null,
+    apiErrorMessage: raw.apiErrorMessage != null ? String(raw.apiErrorMessage) : null,
+    extra:
+      raw.extra && typeof raw.extra === "object"
+        ? (raw.extra as Record<string, unknown>)
+        : {},
+  }
 }
 
 function parseTradeRow(raw: Record<string, unknown>): TradeRow | null {
@@ -157,11 +260,13 @@ export const useBotStore = defineStore("bot", () => {
 
   const symbol = ref("DOGEUSDT")
   const markPrice = ref(0)
+  const markBySymbol = ref<Record<string, number>>({})
   const generatorUpper = ref(0)
   const generatorLower = ref(0)
   const generatorCount = ref(5)
   const maxGeneratorCount = ref(9999)
   const initialCapital = ref(100)
+  const allocatedCapital = ref(100)
   const realizedPnl = ref(0)
   const floatingPnl = ref(0)
   const totalWalletBalance = ref(0)
@@ -169,6 +274,14 @@ export const useBotStore = defineStore("bot", () => {
   const currentCapital = ref(0)
   const marginBalance = ref(0)
   const availableBalance = ref(0)
+  const balanceSource = ref("")
+  const peakEquityUsdt = ref(0)
+  const currentDrawdownPct = ref(0)
+  const trailingEquityStopEnabled = ref(true)
+  const trailingEquityDrawdownLimitPct = ref(10)
+  const trailingEquityStopTriggered = ref(false)
+  const reinjectedRealizedUsdt = ref(0)
+  const autoCompoundingEnabled = ref(true)
   const activeGridLines = ref(5)
   const orders = ref<Record<string, unknown>[]>([])
 
@@ -211,6 +324,19 @@ export const useBotStore = defineStore("bot", () => {
   const tradesBySymbol = ref<Record<string, SymbolTradesPack>>({})
   /** عند النقر على «سجل الصفقات» من كرت شبكة */
   const tradesViewSymbol = ref<string | null>(null)
+  const gridLedgerBySymbol = ref<Record<string, GridLedgerPack>>({})
+
+  /** live = آخر مزامنة ناجحة من Binance؛ pending = مفاتيح موجودة لكن لم تُجلب الأرصدة بعد؛ error = فشل المزامنة */
+  const balanceSyncState = computed((): "no_keys" | "pending" | "live" | "error" => {
+    if (!credentialsConfigured.value) return "no_keys"
+    if (syncError.value) return "error"
+    if (syncOkAt.value) return "live"
+    return "pending"
+  })
+
+  const balanceIsLive = computed(() => balanceSyncState.value === "live")
+
+  const liveEquityUsdt = computed(() => totalWalletBalance.value)
 
   const syncErrorHint = computed(() => {
     const err = syncError.value
@@ -264,6 +390,59 @@ export const useBotStore = defineStore("bot", () => {
     return activeGridSymbols.value.filter((s) => s !== cur)
   })
 
+  const selectedGridMeta = computed(() => {
+    const s = symbol.value.trim().toUpperCase().replace("/", "")
+    return s ? gridsBySymbol.value[s] : undefined
+  })
+
+  const otherGridsAllocatedUsdt = computed(() => {
+    const cur = symbol.value.trim().toUpperCase().replace("/", "")
+    let sum = 0
+    for (const s of activeGridSymbols.value) {
+      if (s === cur) continue
+      sum += Number(gridsBySymbol.value[s]?.allocatedCapital ?? 0)
+    }
+    return sum
+  })
+
+  const maxAllocatableUsdt = computed(() =>
+    Math.max(0, availableBalance.value - otherGridsAllocatedUsdt.value),
+  )
+
+  function symbolMark(sym: string): number {
+    const s = sym.trim().toUpperCase().replace("/", "")
+    if (!s) return 0
+    const room = markBySymbol.value[s]
+    if (room > 0) return room
+    const focus = symbol.value.trim().toUpperCase().replace("/", "")
+    if (s === focus && markPrice.value > 0) return markPrice.value
+    return 0
+  }
+
+  const gridPeakEquityUsdt = computed(() => {
+    const g = selectedGridMeta.value
+    if (isGridActiveForSelectedSymbol.value && g?.peakEquityUsdt != null) {
+      return Number(g.peakEquityUsdt)
+    }
+    return peakEquityUsdt.value
+  })
+
+  const gridDrawdownPct = computed(() => {
+    const g = selectedGridMeta.value
+    if (isGridActiveForSelectedSymbol.value && g?.currentDrawdownPct != null) {
+      return Number(g.currentDrawdownPct)
+    }
+    return currentDrawdownPct.value
+  })
+
+  const gridReinjectedUsdt = computed(() => {
+    const g = selectedGridMeta.value
+    if (isGridActiveForSelectedSymbol.value && g?.cumulativeRealizedUsdt != null) {
+      return Number(g.cumulativeRealizedUsdt)
+    }
+    return reinjectedRealizedUsdt.value
+  })
+
   const gridLevels = computed(() => {
     const lo = generatorLower.value
     const hi = generatorUpper.value
@@ -280,6 +459,30 @@ export const useBotStore = defineStore("bot", () => {
     return String(b).replace(/\/$/, "")
   }
 
+  function applyRiskFields(data: Record<string, unknown>) {
+    if (data.peakEquityUsdt != null) peakEquityUsdt.value = num(data.peakEquityUsdt)
+    if (data.currentDrawdownPct != null) currentDrawdownPct.value = num(data.currentDrawdownPct)
+    if (typeof data.trailingEquityStopEnabled === "boolean") {
+      trailingEquityStopEnabled.value = data.trailingEquityStopEnabled
+    }
+    if (data.trailingEquityDrawdownLimitPct != null) {
+      trailingEquityDrawdownLimitPct.value = num(data.trailingEquityDrawdownLimitPct, 10)
+    }
+    if (typeof data.trailingEquityStopTriggered === "boolean") {
+      trailingEquityStopTriggered.value = data.trailingEquityStopTriggered
+    }
+    if (data.reinjectedRealizedUsdt != null) {
+      reinjectedRealizedUsdt.value = num(data.reinjectedRealizedUsdt)
+    }
+    if (typeof data.autoCompoundingEnabled === "boolean") {
+      autoCompoundingEnabled.value = data.autoCompoundingEnabled
+    } else if (typeof data.profit_injection_mode === "string") {
+      autoCompoundingEnabled.value =
+        data.profit_injection_mode.toLowerCase() === "compound_size"
+    }
+    if (typeof data.balanceSource === "string") balanceSource.value = data.balanceSource
+  }
+
   function applyCredentialsFields(data: Record<string, unknown>) {
     if (data.credentialsConfigured === true) {
       credentialsConfigured.value = true
@@ -289,8 +492,31 @@ export const useBotStore = defineStore("bot", () => {
     }
   }
 
+  function applyAccountMetrics(data: Record<string, unknown>) {
+    if (data.totalWalletBalance != null) totalWalletBalance.value = num(data.totalWalletBalance)
+    if (data.totalMarginBalance != null) totalMarginBalance.value = num(data.totalMarginBalance)
+    if (data.currentCapital != null) currentCapital.value = num(data.currentCapital)
+    if (data.marginBalance != null) marginBalance.value = num(data.marginBalance)
+    if (data.availableBalance != null) availableBalance.value = num(data.availableBalance)
+    if (data.floatingPnl != null) floatingPnl.value = num(data.floatingPnl)
+    if (data.realizedPnl != null) realizedPnl.value = num(data.realizedPnl)
+    if (typeof data.syncError === "string") syncError.value = data.syncError
+    if (typeof data.syncOkAt === "string") syncOkAt.value = data.syncOkAt
+    if (typeof data.exchangeTestnet === "boolean") exchangeTestnet.value = data.exchangeTestnet
+    if (typeof data.binanceEnv === "string" && data.binanceEnv) {
+      binanceEnv.value = data.binanceEnv
+    }
+    if (typeof data.balanceSource === "string") balanceSource.value = data.balanceSource
+    applyCredentialsFields(data)
+    if (typeof data.binanceApiKeyPreview === "string") {
+      binanceApiKeyPreview.value = data.binanceApiKeyPreview
+    }
+    applyRiskFields(data)
+  }
+
   function applySnapshot(data: Record<string, unknown>) {
     applyCredentialsFields(data)
+    applyRiskFields(data)
     if (typeof data.binanceApiKeyPreview === "string") {
       binanceApiKeyPreview.value = data.binanceApiKeyPreview
     }
@@ -321,6 +547,10 @@ export const useBotStore = defineStore("bot", () => {
       Math.floor(num(data.maxGeneratorCount, maxGeneratorCount.value)),
     )
     initialCapital.value = num(data.initialCapital, 100)
+    allocatedCapital.value = num(
+      data.allocatedCapital ?? data.initialCapital,
+      initialCapital.value,
+    )
     realizedPnl.value = num(data.realizedPnl)
     floatingPnl.value = num(data.floatingPnl)
     totalWalletBalance.value = num(data.totalWalletBalance, 0)
@@ -366,10 +596,18 @@ export const useBotStore = defineStore("bot", () => {
       return
     }
     if (msg.type === "mark" && msg.markPrice != null) {
+      const markSym = String(msg.symbol ?? "")
+        .trim()
+        .toUpperCase()
+        .replace("/", "")
       const p = num(msg.markPrice)
-      if (p > 0) {
-        markPrice.value = p
-        pushMarkPoint(p)
+      if (p > 0 && markSym) {
+        markBySymbol.value = { ...markBySymbol.value, [markSym]: p }
+        const focus = symbol.value.trim().toUpperCase().replace("/", "")
+        if (!focus || markSym === focus) {
+          markPrice.value = p
+          pushMarkPoint(p)
+        }
       }
       return
     }
@@ -410,27 +648,44 @@ export const useBotStore = defineStore("bot", () => {
             startedAt:
               typeof d.startedAt === "string" ? d.startedAt : prev.startedAt,
             running: d.running != null ? Boolean(d.running) : prev.running,
+            unrealizedPnlUsdt:
+              d.unrealizedPnlUsdt != null
+                ? num(d.unrealizedPnlUsdt)
+                : prev.unrealizedPnlUsdt,
+            gridEquityUsdt:
+              d.gridEquityUsdt != null ? num(d.gridEquityUsdt) : prev.gridEquityUsdt,
+            deployCapitalUsdt:
+              d.deployCapitalUsdt != null
+                ? num(d.deployCapitalUsdt)
+                : prev.deployCapitalUsdt,
           },
         }
+        const cum = num(d.cumulativeRealizedUsdt)
+        if (cum > reinjectedRealizedUsdt.value) reinjectedRealizedUsdt.value = cum
       }
       return
     }
     if (msg.type === "metrics" && msg.data) {
-      const d = msg.data
-      if (d.totalWalletBalance != null) totalWalletBalance.value = num(d.totalWalletBalance)
-      if (d.totalMarginBalance != null) totalMarginBalance.value = num(d.totalMarginBalance)
-      if (d.currentCapital != null) currentCapital.value = num(d.currentCapital)
-      if (d.marginBalance != null) marginBalance.value = num(d.marginBalance)
-      if (d.availableBalance != null) availableBalance.value = num(d.availableBalance)
-      if (d.floatingPnl != null) floatingPnl.value = num(d.floatingPnl)
-      if (d.realizedPnl != null) realizedPnl.value = num(d.realizedPnl)
-      if (typeof d.syncError === "string") syncError.value = d.syncError
-      if (typeof d.syncOkAt === "string") syncOkAt.value = d.syncOkAt
-      if (typeof d.exchangeTestnet === "boolean") exchangeTestnet.value = d.exchangeTestnet
+      applyAccountMetrics(msg.data as Record<string, unknown>)
       return
     }
     if (msg.type === "sync_error" && typeof msg.message === "string") {
       syncError.value = msg.message
+      syncOkAt.value = ""
+      balanceSource.value = ""
+      return
+    }
+    if (msg.type === "trades_refresh") {
+      const sym = String(msg.symbol ?? "")
+        .trim()
+        .toUpperCase()
+        .replace("/", "")
+      if (sym) {
+        void fetchTradesForSymbol(sym, { quiet: true })
+        if (tradesViewSymbol.value === sym) {
+          void fetchTrades({ quiet: true })
+        }
+      }
       return
     }
     if (msg.type === "order" && msg.data) {
@@ -455,8 +710,14 @@ export const useBotStore = defineStore("bot", () => {
       }
       return
     }
+    if (msg.type === "grid_ledger") {
+      applyGridLedgerWs(msg)
+      return
+    }
     if (msg.type === "emergency") {
       wsError.value = `Emergency stop @ ${msg.ts ?? ""}`
+      void fetchGridStatus()
+      void fetchGridLedger(symbol.value)
     }
   }
 
@@ -574,29 +835,10 @@ export const useBotStore = defineStore("bot", () => {
   }
 
   async function bootstrapDashboard() {
-    const cfg = useRuntimeConfig()
-    const botId = String(cfg.public.botId)
-    try {
-      const cred = await $fetch<{
-        hasKeys: boolean
-        binanceApiKeyPreview: string
-        binanceTestnet: boolean
-      }>(`${publicApiPrefix()}/api/bots/${botId}/credentials`, { timeout: 8_000 })
-      if (cred.hasKeys) {
-        credentialsConfigured.value = true
-        credentialsLocked = true
-        binanceApiKeyPreview.value = cred.binanceApiKeyPreview || ""
-        binanceTestnetStored.value = cred.binanceTestnet
-        exchangeTestnet.value = Boolean(cred.binanceTestnet)
-      }
-      apiReachable.value = true
-    } catch {
-      /* credentials endpoint optional if dashboard succeeds */
-    }
     try {
       await fetchDashboard()
     } catch {
-      /* keep locked credentials; WS may still stream hub state */
+      /* WS may still stream hub state after API comes up */
     }
   }
 
@@ -659,18 +901,10 @@ export const useBotStore = defineStore("bot", () => {
     await fetchDashboard()
   }
 
-  async function saveSettings(payload: {
+  async function saveGridBand(payload: {
     generatorUpper: number
     generatorLower: number
     generatorCount: number
-    maxGeneratorCount?: number
-    initialCapital: number
-    trailingOffset?: number
-    trailing_stop_pct?: number
-    compoundingFactor?: number
-    profit_injection_mode?: string
-    max_slippage_pct?: number
-    dca_mode?: string
   }) {
     const cfg = useRuntimeConfig()
     const botId = String(cfg.public.botId)
@@ -679,6 +913,33 @@ export const useBotStore = defineStore("bot", () => {
       { method: "PATCH", body: payload },
     )
     applySnapshot(merged)
+  }
+
+  async function setAutoCompounding(enabled: boolean) {
+    const cfg = useRuntimeConfig()
+    const botId = String(cfg.public.botId)
+    const merged = await $fetch<Record<string, unknown>>(
+      `${publicApiPrefix()}/api/bots/${botId}/settings`,
+      {
+        method: "PATCH",
+        body: {
+          autoCompoundingEnabled: enabled,
+          ...(enabled
+            ? { profit_injection_mode: "compound_size", compoundingFactor: 1.0 }
+            : {}),
+        },
+      },
+    )
+    applySnapshot(merged)
+  }
+
+  /** @deprecated use saveGridBand — kept for compatibility */
+  async function saveSettings(payload: {
+    generatorUpper: number
+    generatorLower: number
+    generatorCount: number
+  }) {
+    await saveGridBand(payload)
   }
 
   async function fetchMarkets() {
@@ -719,20 +980,116 @@ export const useBotStore = defineStore("bot", () => {
   async function selectSymbol(sym: string) {
     const normalized = sym.trim().toUpperCase().replace("/", "")
     if (!normalized || normalized === symbol.value) return
+    const prev = symbol.value
+    symbol.value = normalized
+    clearMarkSeries()
     const cfg = useRuntimeConfig()
     const botId = String(cfg.public.botId)
-    const merged = await $fetch<Record<string, unknown>>(
-      `${publicApiPrefix()}/api/bots/${botId}/settings`,
-      { method: "PATCH", body: { symbol: normalized } },
-    )
-    clearMarkSeries()
-    applySnapshot(merged)
-    await fetchTrades()
+    try {
+      const merged = await $fetch<Record<string, unknown>>(
+        `${publicApiPrefix()}/api/bots/${botId}/settings`,
+        { method: "PATCH", body: { symbol: normalized } },
+      )
+      applySnapshot(merged)
+      await fetchTrades()
+    } catch (e) {
+      symbol.value = prev
+      throw e
+    }
   }
 
   function symbolTradesPack(sym: string): SymbolTradesPack {
     const key = sym.trim().toUpperCase().replace("/", "")
     return tradesBySymbol.value[key] ?? emptySymbolTradesPack()
+  }
+
+  function gridLedgerPack(sym: string): GridLedgerPack | null {
+    const key = sym.trim().toUpperCase().replace("/", "")
+    return gridLedgerBySymbol.value[key] ?? null
+  }
+
+  function applyGridLedgerWs(msg: Extract<WsMsg, { type: "grid_ledger" }>) {
+    const key = String(msg.symbol ?? "")
+      .trim()
+      .toUpperCase()
+      .replace("/", "")
+    if (!key) return
+    if (msg.cleared) {
+      const next = { ...gridLedgerBySymbol.value }
+      delete next[key]
+      gridLedgerBySymbol.value = next
+      return
+    }
+    const prev = gridLedgerBySymbol.value[key] ?? {
+      symbol: key,
+      frozen: false,
+      freezeReason: "",
+      entries: [],
+    }
+    let entries = [...prev.entries]
+    if (Array.isArray(msg.entries)) {
+      const parsed = msg.entries
+        .map((r) => parseGridLedgerEntry(r as Record<string, unknown>))
+        .filter((r): r is GridLedgerEntry => r != null)
+      entries = mergeLedgerEntries(entries, parsed)
+    } else if (msg.entry) {
+      const row = parseGridLedgerEntry(msg.entry)
+      if (row) {
+        entries = mergeLedgerEntries(entries, [row])
+      }
+    }
+    gridLedgerBySymbol.value = {
+      ...gridLedgerBySymbol.value,
+      [key]: {
+        symbol: key,
+        frozen: Boolean(msg.frozen ?? prev.frozen),
+        freezeReason: String(msg.freezeReason ?? prev.freezeReason ?? ""),
+        entries,
+      },
+    }
+  }
+
+  async function fetchGridLedger(sym: string) {
+    const cfg = useRuntimeConfig()
+    const botId = String(cfg.public.botId)
+    const normalized = sym.trim().toUpperCase().replace("/", "")
+    const data = await $fetch<{
+      symbol?: string
+      frozen?: boolean
+      freezeReason?: string
+      entries?: Record<string, unknown>[]
+    }>(`${publicApiPrefix()}/api/bots/${botId}/grid/ledger`, {
+      query: { symbol: normalized },
+      timeout: 10_000,
+    })
+    const entries = mergeLedgerEntries(
+      [],
+      (data.entries ?? [])
+        .map((r) => parseGridLedgerEntry(r))
+        .filter((r): r is GridLedgerEntry => r != null),
+    )
+    gridLedgerBySymbol.value = {
+      ...gridLedgerBySymbol.value,
+      [normalized]: {
+        symbol: normalized,
+        frozen: Boolean(data.frozen),
+        freezeReason: String(data.freezeReason ?? ""),
+        entries,
+      },
+    }
+  }
+
+  async function clearGridLedger(sym: string) {
+    const cfg = useRuntimeConfig()
+    const botId = String(cfg.public.botId)
+    const normalized = sym.trim().toUpperCase().replace("/", "")
+    await $fetch(`${publicApiPrefix()}/api/bots/${botId}/grid/ledger/clear`, {
+      method: "POST",
+      query: { symbol: normalized },
+    })
+    const next = { ...gridLedgerBySymbol.value }
+    delete next[normalized]
+    gridLedgerBySymbol.value = next
   }
 
   async function fetchTradesForSymbol(sym: string, opts?: { quiet?: boolean }) {
@@ -902,6 +1259,7 @@ export const useBotStore = defineStore("bot", () => {
     levels?: number
     maxGeneratorCount?: number
     initialCapital?: number
+    allocatedCapital?: number
     generatorUpper?: number
     generatorLower?: number
     generatorCount?: number
@@ -921,53 +1279,28 @@ export const useBotStore = defineStore("bot", () => {
         : opts?.levels != null
           ? Math.max(2, Math.floor(opts.levels))
           : Math.max(2, Math.floor(generatorCount.value))
-    const mx =
-      opts?.maxGeneratorCount != null
-        ? Math.max(2, Math.floor(opts.maxGeneratorCount))
-        : Math.max(lv + 1, Math.floor(maxGeneratorCount.value))
-    const cap =
-      opts?.initialCapital != null && opts.initialCapital > 0
-        ? opts.initialCapital
-        : initialCapital.value > 0
-          ? initialCapital.value
-          : 40
-
     const manualBand =
       typeof opts?.generatorUpper === "number" &&
       typeof opts?.generatorLower === "number" &&
       opts.generatorUpper > opts.generatorLower
-    const useManual = opts?.calibrate === false || manualBand
 
     const body: Record<string, unknown> = {
       symbol: sym,
-      initialCapital: cap,
+      calibrate: false,
+      generatorUpper: manualBand ? opts!.generatorUpper! : generatorUpper.value,
+      generatorLower: manualBand ? opts!.generatorLower! : generatorLower.value,
+      generatorCount: lv,
     }
-    const advKeys = [
-      "trailingOffset",
-      "trailing_stop_pct",
-      "compoundingFactor",
-      "profit_injection_mode",
-      "max_slippage_pct",
-      "dca_mode",
-    ] as const
-    for (const k of advKeys) {
-      const v = opts?.[k]
-      if (v != null && v !== "") body[k] = v
+    if (autoCompoundingEnabled.value) {
+      body.autoCompoundingEnabled = true
+      body.profit_injection_mode = "compound_size"
+      body.compoundingFactor = 1.0
     }
-
-    if (useManual) {
-      body.calibrate = false
-      body.generatorUpper = manualBand ? opts!.generatorUpper! : generatorUpper.value
-      body.generatorLower = manualBand ? opts!.generatorLower! : generatorLower.value
-      body.generatorCount = lv
-      body.maxGeneratorCount = mx
-    } else {
-      body.calibrate = true
-      body.levels = lv
-      body.maxGeneratorCount = mx
-      if (opts?.generatorCount != null) {
-        body.generatorCount = lv
-      }
+    const alloc =
+      opts?.allocatedCapital ?? opts?.initialCapital ?? allocatedCapital.value
+    if (alloc > 0) {
+      body.allocatedCapital = alloc
+      body.initialCapital = alloc
     }
 
     const res = await $fetch<Record<string, unknown>>(
@@ -983,6 +1316,7 @@ export const useBotStore = defineStore("bot", () => {
     await fetchDashboard()
     await fetchGridStatus()
     await fetchTrades()
+    void fetchGridLedger(sym)
     return res
   }
 
@@ -1056,11 +1390,20 @@ export const useBotStore = defineStore("bot", () => {
     otherActiveGridSymbols,
     symbol,
     markPrice,
+    markBySymbol,
+    symbolMark,
     generatorUpper,
     generatorLower,
     generatorCount,
     maxGeneratorCount,
     initialCapital,
+    allocatedCapital,
+    selectedGridMeta,
+    otherGridsAllocatedUsdt,
+    maxAllocatableUsdt,
+    gridPeakEquityUsdt,
+    gridDrawdownPct,
+    gridReinjectedUsdt,
     realizedPnl,
     floatingPnl,
     totalWalletBalance,
@@ -1068,6 +1411,17 @@ export const useBotStore = defineStore("bot", () => {
     currentCapital,
     marginBalance,
     availableBalance,
+    balanceSource,
+    balanceSyncState,
+    balanceIsLive,
+    liveEquityUsdt,
+    peakEquityUsdt,
+    currentDrawdownPct,
+    trailingEquityStopEnabled,
+    trailingEquityDrawdownLimitPct,
+    trailingEquityStopTriggered,
+    reinjectedRealizedUsdt,
+    autoCompoundingEnabled,
     activeGridLines,
     orders,
     markSeriesData,
@@ -1097,6 +1451,10 @@ export const useBotStore = defineStore("bot", () => {
     gridsBySymbol,
     tradesBySymbol,
     tradesViewSymbol,
+    gridLedgerBySymbol,
+    gridLedgerPack,
+    fetchGridLedger,
+    clearGridLedger,
     symbolTradesPack,
     fetchTradesForSymbol,
     refreshActiveGridTrades,
@@ -1111,6 +1469,8 @@ export const useBotStore = defineStore("bot", () => {
     saveCredentials,
     clearCredentials,
     saveSettings,
+    saveGridBand,
+    setAutoCompounding,
     fetchMarkets,
     selectSymbol,
     fetchTrades,

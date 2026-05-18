@@ -44,6 +44,14 @@ _ACCOUNT_KEYS = frozenset(
         "syncOkAt",
         "exchangeTestnet",
         "binanceEnv",
+        "peakEquityUsdt",
+        "currentDrawdownPct",
+        "trailingEquityStopEnabled",
+        "trailingEquityDrawdownLimitPct",
+        "trailingEquityStopTriggered",
+        "reinjectedRealizedUsdt",
+        "autoCompoundingEnabled",
+        "balanceSource",
     }
 )
 
@@ -88,12 +96,23 @@ class BotHub:
     def last_focus_symbol(self) -> str:
         return self._last_focus_symbol
 
-    def flat_state(self, focus_symbol: str | None) -> dict[str, Any]:
+    def _flat_merge(self, focus_symbol: str | None) -> dict[str, Any]:
+        """Room grid fields + account wallet metrics (account keys always win)."""
         fs = _normalize_sym(focus_symbol or self._last_focus_symbol or "DOGEUSDT")
-        out = dict(self._account)
         room = dict(self._rooms.get(fs, self._room_defaults(fs)))
-        out.update(room)
+        out = dict(room)
+        for k in _ACCOUNT_KEYS:
+            if k in self._account:
+                out[k] = self._account[k]
         return out
+
+    def flat_state(self, focus_symbol: str | None) -> dict[str, Any]:
+        return dict(self._flat_merge(focus_symbol))
+
+    def room_state(self, symbol: str) -> dict[str, Any]:
+        """Per-symbol grid fields + account metrics (isolated markPrice per room)."""
+        sym = _normalize_sym(symbol)
+        return dict(self._flat_merge(sym))
 
     def rooms_view(self) -> dict[str, dict[str, Any]]:
         return {k: dict(v) for k, v in self._rooms.items()}
@@ -135,6 +154,12 @@ class BotHub:
                 if k in _ACCOUNT_KEYS and v is not None:
                     self._account[k] = v
 
+            if sym_u:
+                self._last_focus_symbol = sym_u
+                room = dict(self._rooms.get(sym_u, self._room_defaults(sym_u)))
+                room["symbol"] = sym_u
+                self._rooms[sym_u] = room
+
             keys_to_skip = _ACCOUNT_KEYS | {"symbol"}
             room_patch = {k: v for k, v in patch.items() if k not in keys_to_skip and v is not None}
             if room_patch:
@@ -146,19 +171,15 @@ class BotHub:
                     base[k] = v
                 if patch.get("generatorCount") is not None:
                     base["activeGridLines"] = int(patch["generatorCount"])
+                base["symbol"] = fs
                 self._rooms[fs] = base
-                if sym_u:
-                    self._last_focus_symbol = sym_u
+                self._last_focus_symbol = fs
 
             focus = sym_u or self._last_focus_symbol
             return dict(self.flat_state_unlocked(focus))
 
     def flat_state_unlocked(self, focus_symbol: str | None = None) -> dict[str, Any]:
-        fs = _normalize_sym(focus_symbol or self._last_focus_symbol or "DOGEUSDT")
-        out = dict(self._account)
-        room = dict(self._rooms.get(fs, self._room_defaults(fs)))
-        out.update(room)
-        return out
+        return dict(self._flat_merge(focus_symbol))
 
     async def remove_room(self, symbol: str) -> None:
         sym = _normalize_sym(symbol)

@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import AuditLogPanel from "~/components/AuditLogPanel.vue"
 import BotAssignedActivityPanel from "~/components/BotAssignedActivityPanel.vue"
+import CompoundingRiskPanel from "~/components/CompoundingRiskPanel.vue"
+import EmergencyBar from "~/components/EmergencyBar.vue"
 import { useBotStore } from "~/stores/bot"
 
 const store = useBotStore()
@@ -11,8 +12,6 @@ function closeTradesJournal() {
 
 /** Defer chart mount until dashboard (symbol + balances) is hydrated from the API. */
 const dashboardLoaded = ref(false)
-const dashTab = ref<"main" | "audit">("main")
-const auditPanelRef = ref<{ refresh: () => Promise<void> } | null>(null)
 
 onMounted(async () => {
   store.connectWs()
@@ -22,12 +21,6 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   store.disconnectWs()
-})
-
-watch(dashTab, (t) => {
-  if (t === "audit") {
-    void auditPanelRef.value?.refresh?.()
-  }
 })
 </script>
 
@@ -75,84 +68,78 @@ watch(dashTab, (t) => {
           لا توجد مفاتيح — عيّن <code>BINANCE_API_KEY</code> و <code>BINANCE_ENV</code> في <code>.env</code> ثم أعد تشغيل API
         </template>
         <template v-else-if="store.syncError">
-          {{ store.syncError }}
+          <strong>خطأ مزامنة Binance:</strong> {{ store.syncError }}
           <span v-if="store.syncErrorHint" class="status-hint"> — {{ store.syncErrorHint }}</span>
         </template>
       </div>
 
-      <nav class="dash-tabs" role="tablist" aria-label="أقسام اللوحة">
-        <button
-          type="button"
-          role="tab"
-          :aria-selected="dashTab === 'main'"
-          class="dash-tab"
-          :class="{ active: dashTab === 'main' }"
-          @click="dashTab = 'main'"
-        >
-          لوحة التداول
-        </button>
-        <button
-          type="button"
-          role="tab"
-          :aria-selected="dashTab === 'audit'"
-          class="dash-tab"
-          :class="{ active: dashTab === 'audit' }"
-          @click="dashTab = 'audit'"
-        >
-          سجل العمليات
-        </button>
-      </nav>
+      <div
+        v-else-if="store.balanceSyncState === 'pending'"
+        class="status-banner status-pending"
+        role="status"
+      >
+        جاري مزامنة الرصيد الحي من Binance…
+      </div>
 
-      <template v-if="dashTab === 'main'">
+      <EmergencyBar v-if="dashboardLoaded" />
+
       <section class="balance-hero panel">
         <div class="balance-hero-head">
-          <h2>رصيد الحساب</h2>
+          <div>
+            <h2>إجمالي Equity</h2>
+            <p class="balance-source">
+              <span v-if="store.balanceIsLive" class="live-dot" aria-hidden="true" />
+              Binance Spot · مباشر من API
+              <span v-if="store.syncOkAt" class="sync-time">
+                · {{ new Date(store.syncOkAt).toLocaleTimeString() }}
+              </span>
+            </p>
+          </div>
           <span class="sym-pill">{{ store.symbol }}</span>
         </div>
-        <div class="balance-cards">
-          <div class="balance-card">
-            <div class="balance-label">رصيد USDT متاح</div>
-            <div class="balance-num">
-              {{ store.availableBalance.toFixed(2) }} <span class="unit">USDT</span>
+        <div class="balance-main">
+          <div class="balance-primary">
+            <span class="balance-num">
+              {{
+                store.balanceIsLive
+                  ? store.liveEquityUsdt.toLocaleString(undefined, {
+                      minimumFractionDigits: 2,
+                      maximumFractionDigits: 2,
+                    })
+                  : "—"
+              }}
+            </span>
+            <span class="balance-unit">USDT</span>
+          </div>
+          <div class="balance-sub-row">
+            <div class="balance-sub">
+              <span class="sub-label">متاح</span>
+              <span class="sub-val">{{
+                store.balanceIsLive ? store.availableBalance.toFixed(2) : "—"
+              }}</span>
+            </div>
+            <div class="balance-sub">
+              <span class="sub-label">Mark</span>
+              <span class="sub-val">{{
+                store.markPrice > 0 ? store.markPrice.toFixed(6) : "—"
+              }}</span>
             </div>
           </div>
-          <div class="balance-card">
-            <div class="balance-label">إجمالي محفظة USDT</div>
-            <div class="balance-num">
-              {{ store.totalWalletBalance.toFixed(2) }} <span class="unit">USDT</span>
-            </div>
-          </div>
+          <p v-if="store.balanceSyncState === 'pending'" class="balance-warn">
+            في انتظار مزامنة الرصيد الحي — لا يُعرض رصيد وهمي.
+          </p>
+          <p v-else-if="store.balanceSyncState === 'error'" class="balance-warn">
+            تعذّرت المزامنة — الرقم أعلاه غير متاح حتى يعود الاتصال بـ Binance.
+          </p>
         </div>
       </section>
 
-      <section class="grid-cards panel metrics">
-        <div>
-          <div class="metric-label">سعر Mark</div>
-          <div class="metric-value">{{ store.markPrice > 0 ? store.markPrice.toFixed(6) : "—" }}</div>
-        </div>
-        <div>
-          <div class="metric-label">ربح محقق</div>
-          <div class="metric-value" :class="store.realizedPnl >= 0 ? 'pnl-up' : 'pnl-down'">
-            {{ store.realizedPnl >= 0 ? "+" : "" }}{{ store.realizedPnl.toFixed(4) }}
-          </div>
-        </div>
-        <div>
-          <div class="metric-label">خطوط الشبكة</div>
-          <div class="metric-value">
-            {{ store.generatorCount }}
-            <span class="muted"> / {{ store.maxGeneratorCount }}</span>
-          </div>
-        </div>
-        <div>
-          <div class="metric-label">المزامنة</div>
-          <div class="metric-value metric-sm">{{ store.syncError ? "خطأ" : store.syncOkAt ? "OK" : "—" }}</div>
-        </div>
-      </section>
+      <CompoundingRiskPanel v-if="dashboardLoaded && store.credentialsConfigured" />
 
       <section class="chart-wrap panel">
         <h2 class="chart-title">الشموع — {{ store.symbol }} (15m)</h2>
         <ClientOnly>
-          <TradingChart v-if="dashboardLoaded" />
+          <TradingChart v-if="dashboardLoaded" :key="store.symbol" />
           <div v-else class="chart-fallback">جاري تحميل الإعدادات والرسم…</div>
           <template #fallback>
             <div class="chart-fallback">جاري تحميل الرسم…</div>
@@ -166,8 +153,7 @@ watch(dashTab, (t) => {
         v-if="dashboardLoaded && store.credentialsConfigured && !store.showLiveBotPanels"
         class="idle-hint muted"
       >
-        لا شبكة نشطة ولا أوامر معلّقة — سجل الصفقات وسجل العمليات في تبويب
-        <button type="button" class="idle-hint-link" @click="dashTab = 'audit'">سجل العمليات</button>.
+        لا شبكة نشطة ولا أوامر معلّقة — يمكنك تشغيل الشبكة من إعدادات Spot أدناه.
       </p>
 
       <ActiveGridCards v-if="dashboardLoaded && store.activeGridSymbols.length" />
@@ -192,12 +178,6 @@ watch(dashTab, (t) => {
           !store.activeGridSymbols.length
         "
       />
-      </template>
-
-      <template v-else>
-        <TradeJournal v-if="dashboardLoaded" />
-        <AuditLogPanel ref="auditPanelRef" />
-      </template>
     </main>
   </div>
 </template>
@@ -330,39 +310,16 @@ watch(dashTab, (t) => {
   color: #ffb4c0;
   line-height: 1.45;
 }
+.status-banner.status-pending {
+  background: rgba(240, 185, 11, 0.1);
+  border-color: rgba(240, 185, 11, 0.45);
+  color: #f0d78c;
+}
 .status-banner code {
   font-size: 0.78rem;
 }
 .status-hint {
   color: #fde68a;
-}
-.dash-tabs {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.35rem;
-  padding: 0.15rem;
-  background: rgba(15, 18, 22, 0.65);
-  border: 1px solid #2b3139;
-  border-radius: 8px;
-}
-.dash-tab {
-  border: 1px solid transparent;
-  background: transparent;
-  color: #848e9c;
-  font-size: 0.82rem;
-  font-weight: 600;
-  padding: 0.45rem 0.85rem;
-  border-radius: 6px;
-  cursor: pointer;
-}
-.dash-tab:hover {
-  color: #eaecef;
-  background: rgba(43, 49, 57, 0.5);
-}
-.dash-tab.active {
-  color: #f0b90b;
-  border-color: rgba(240, 185, 11, 0.45);
-  background: rgba(240, 185, 11, 0.08);
 }
 .balance-hero h2 {
   margin: 0;
@@ -386,40 +343,76 @@ watch(dashTab, (t) => {
   color: #7dd3fc;
   border: 1px solid rgba(56, 189, 248, 0.35);
 }
-.balance-cards {
-  display: grid;
-  grid-template-columns: repeat(2, 1fr);
-  gap: 0.75rem;
-}
-@media (max-width: 720px) {
-  .balance-cards {
-    grid-template-columns: 1fr;
-  }
-}
-.balance-card {
-  background: linear-gradient(160deg, rgba(30, 38, 48, 0.95), rgba(15, 18, 22, 0.98));
-  border: 1px solid rgba(56, 189, 248, 0.15);
-  border-radius: 12px;
-  padding: 1rem 1.1rem;
-}
-.balance-label {
+.balance-source {
+  margin: 0.25rem 0 0;
   font-size: 0.72rem;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: var(--muted);
-  margin-bottom: 0.35rem;
+  color: #848e9c;
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+}
+.live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #0ecb81;
+  box-shadow: 0 0 6px rgba(14, 203, 129, 0.6);
+}
+.sync-time {
+  color: #5e6673;
+}
+.balance-main {
+  background: #181a20;
+  border: 1px solid #2b3139;
+  border-radius: 8px;
+  padding: 1rem 1.15rem;
+}
+.balance-primary {
+  display: flex;
+  align-items: baseline;
+  gap: 0.4rem;
+  margin-bottom: 0.85rem;
 }
 .balance-num {
-  font-size: 1.45rem;
+  font-size: 2rem;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
   letter-spacing: -0.02em;
+  color: #eaecef;
 }
-.balance-num .unit {
-  font-size: 0.75rem;
+.balance-unit {
+  font-size: 0.85rem;
   font-weight: 600;
-  color: var(--muted);
-  margin-inline-start: 0.2rem;
+  color: #848e9c;
+}
+.balance-sub-row {
+  display: flex;
+  gap: 1.5rem;
+  flex-wrap: wrap;
+}
+.balance-sub {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+.sub-label {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #848e9c;
+}
+.sub-val {
+  font-size: 0.95rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: #eaecef;
+}
+.balance-warn {
+  margin: 0.75rem 0 0;
+  font-size: 0.78rem;
+  color: #f0b90b;
+  line-height: 1.45;
 }
 .chart-title {
   margin: 0 0 0.65rem;
@@ -477,15 +470,5 @@ watch(dashTab, (t) => {
   border-radius: 8px;
   background: rgba(43, 49, 57, 0.35);
   border: 1px solid rgba(43, 49, 57, 0.6);
-}
-.idle-hint-link {
-  background: none;
-  border: none;
-  padding: 0;
-  color: #7dd3fc;
-  font: inherit;
-  font-weight: 600;
-  cursor: pointer;
-  text-decoration: underline;
 }
 </style>

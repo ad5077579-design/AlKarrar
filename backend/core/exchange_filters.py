@@ -89,6 +89,28 @@ def min_trade_qty(price: float, filters: dict[str, float]) -> float:
     )
 
 
+def format_base_qty_from_usdt_slice(
+    *,
+    usdt_per_line: float,
+    mark: float,
+    filters: dict[str, float],
+) -> tuple[float, str]:
+    """
+    Convert a USDT allocation per grid line into a Binance-valid base quantity string.
+
+    Applies PRICE_FILTER (via mark) and LOT_SIZE + MIN_NOTIONAL so downstream orders avoid -1013.
+    """
+    if usdt_per_line <= 0 or mark <= 0:
+        return 0.0, "0"
+    raw_qty = usdt_per_line / mark
+    _, qty_s = normalize_order(mark, raw_qty, filters)
+    try:
+        qty_f = float(qty_s)
+    except (TypeError, ValueError):
+        qty_f = 0.0
+    return qty_f, qty_s
+
+
 def normalize_order(price: float, qty: float, filters: dict[str, float]) -> tuple[str, str]:
     tick = filters.get("tick_size", 0)
     step = filters.get("step_size", 0)

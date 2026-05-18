@@ -109,6 +109,21 @@ def normalize_user_stream_trade(order_payload: dict[str, Any]) -> dict[str, Any]
     }
 
 
+def commission_to_usdt_row(row: dict[str, Any]) -> float:
+    comm = _f(row.get("commission"))
+    if comm <= 0:
+        return 0.0
+    asset = str(row.get("commissionAsset") or "USDT").upper()
+    if asset in ("USDT", "USDC", "BUSD", "FDUSD"):
+        return comm
+    sym = str(row.get("symbol", "")).upper().replace("/", "")
+    base = sym[:-4] if sym.endswith("USDT") else sym
+    if asset == base:
+        px = _f(row.get("price"))
+        return comm * px if px > 0 else 0.0
+    return 0.0
+
+
 def summarize_trades(rows: list[dict[str, Any]]) -> dict[str, Any]:
     total_quote = 0.0
     total_pnl = 0.0
@@ -118,7 +133,7 @@ def summarize_trades(rows: list[dict[str, Any]]) -> dict[str, Any]:
     for r in rows:
         total_quote += _f(r.get("quoteQty"))
         total_pnl += _f(r.get("realizedPnl"))
-        total_commission += _f(r.get("commission"))
+        total_commission += commission_to_usdt_row(r)
         if str(r.get("side", "")).upper() == "BUY":
             buy_count += 1
         elif str(r.get("side", "")).upper() == "SELL":
@@ -216,9 +231,14 @@ async def sync_trades_from_exchange(
     bot_id: str,
     symbol: str,
     limit: int,
+    start_time_ms: int | None = None,
 ) -> list[dict[str, Any]]:
     sym = symbol.upper().replace("/", "")
-    raw = await client.get_account_trades(symbol=sym, limit=limit)
+    raw = await client.get_account_trades(
+        symbol=sym,
+        limit=limit,
+        start_time_ms=start_time_ms,
+    )
     normalized: list[dict[str, Any]] = []
     for row in raw:
         n = normalize_binance_trade_row(row)

@@ -8,6 +8,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select
 
 from backend.api import mark_feed, spot_account_sync, spot_user_stream
+from backend.api.grid_recovery import reconcile_snapshots_for_current_credentials, resume_grids_after_startup
+from backend.api.maintenance_tasks import run_maintenance_loop, run_maintenance_once
 from backend.api.bot_hub import hub
 from backend.api.routers import api_router, dashboard
 from backend.api.ws_endpoint import websocket_dashboard
@@ -52,6 +54,12 @@ async def lifespan(app: FastAPI):
         import logging
 
         logging.getLogger(__name__).warning("initial spot sync failed", exc_info=True)
+    try:
+        await run_maintenance_once()
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).warning("initial maintenance purge failed", exc_info=True)
     stop = asyncio.Event()
     mark_task = asyncio.create_task(mark_feed.run_mark_price_feed(stop), name="mark-feed")
     acct_task = asyncio.create_task(spot_account_sync.run_account_sync_loop_env(stop), name="acct-sync")
@@ -59,11 +67,23 @@ async def lifespan(app: FastAPI):
         spot_user_stream.run_spot_user_stream(stop, bot_id="default"),
         name="user-stream",
     )
+    maint_task = asyncio.create_task(run_maintenance_loop(stop), name="db-maintenance")
+    try:
+        await reconcile_snapshots_for_current_credentials(bot_id="default")
+        resumed = await resume_grids_after_startup(bot_id="default")
+        if resumed:
+            import logging
+
+            logging.getLogger(__name__).info("auto-resumed grids: %s", ", ".join(resumed))
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).exception("grid auto-resume on startup failed")
     yield
     try:
         from backend.api.grid_manager import grid_manager
 
-        await grid_manager.stop_all()
+        await grid_manager.stop_all(manual=False)
     except Exception:
         pass
     stop.set()
@@ -80,6 +100,11 @@ async def lifespan(app: FastAPI):
         pass
     try:
         await user_task
+    except asyncio.CancelledError:
+        pass
+    maint_task.cancel()
+    try:
+        await maint_task
     except asyncio.CancelledError:
         pass
 

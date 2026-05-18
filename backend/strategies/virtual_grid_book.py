@@ -170,10 +170,10 @@ class VirtualGridBook:
                 continue
             p = ln.price
             if ln.side == Side.BUY:
-                if prev_mark > p >= mark or (prev_mark > p and mark <= p):
+                if prev_mark > p >= mark:
                     out.append(ln)
             else:
-                if prev_mark < p <= mark or (prev_mark < p and mark >= p):
+                if prev_mark < p <= mark:
                     out.append(ln)
         out.sort(key=lambda x: abs(x.price - mark))
         return out

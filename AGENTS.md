@@ -1,5 +1,7 @@
 # AlKarrar Pro — دليل المشروع للوكيل (اقرأ هذا أولاً)
 
+> **Human contributors:** start with [README.md](README.md), [ARCHITECTURE.md](ARCHITECTURE.md), [docs/TRADE_LOGIC.md](docs/TRADE_LOGIC.md), [CONTRIBUTING.md](CONTRIBUTING.md).
+
 
 
 مشروع تداول **Binance Spot** مع لوحة تحكم **Nuxt 3 + Pinia** وخادم **FastAPI** (BFF + WebSocket). الافتراضي الموصى به في `.env.example`: **Spot Demo** (`BINANCE_ENV=demo`) — مفاتيح من [demo.binance.com](https://demo.binance.com).
@@ -74,7 +76,7 @@ python scripts/test_binance_spot_keys.py --mainnet
 
 | `backend/core/binance_client.py` | عميل Spot (`BinanceSpotClient`: REST + user stream URL) |
 
-| `backend/api/credential_resolver.py` | مفاتيح DB ثم `.env` → `(key, secret, env, legacy)` |
+| `backend/api/credential_resolver.py` | مفاتيح `.env` + اكتشاف env تلقائي → `(key, secret, env, legacy)` |
 
 | `backend/api/binance_pool.py` | عميل REST مشترك لكل مزامنة (حسب env) |
 

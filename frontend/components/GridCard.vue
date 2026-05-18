@@ -2,10 +2,13 @@
 import { computed, ref } from "vue"
 import { useBotStore, type GridLineTrailRow, type GridSymbolMeta } from "~/stores/bot"
 import {
+  buildFifoPnlState,
   fifoRealizedUsdt,
+  fifoUnrealizedUsdt,
   gridSessionFills,
   summarizeGridSessionFills,
 } from "~/utils/fifoSpotPnl"
+import { uniqueOrderCount } from "~/utils/tradeDisplay"
 
 const props = defineProps<{
   symbol: string
@@ -27,6 +30,10 @@ const sessionFills = computed(() => {
   return summarizeGridSessionFills(fills)
 })
 
+const sessionOrderCount = computed(() =>
+  uniqueOrderCount(gridSessionFills(pack.value.trades, props.meta.startedAt)),
+)
+
 const fifoClosedPnl = computed(() =>
   fifoRealizedUsdt(gridSessionFills(pack.value.trades, props.meta.startedAt)),
 )
@@ -38,8 +45,24 @@ const closedPnl = computed(() => {
   return fifoClosedPnl.value
 })
 
+const liveMark = computed(() => store.symbolMark(props.symbol))
+
+const floatingPnl = computed(() => {
+  const ws = props.meta.unrealizedPnlUsdt
+  if (ws != null && Number.isFinite(ws)) return Number(ws)
+  const fills = gridSessionFills(pack.value.trades, props.meta.startedAt)
+  return fifoUnrealizedUsdt(buildFifoPnlState(fills, props.meta.startedAt), liveMark.value)
+})
+
+const totalPnl = computed(() => closedPnl.value + floatingPnl.value)
+
 const activeTrailLines = computed(() =>
-  (props.meta.lineTrail ?? []).filter((r) => r.phase && r.phase !== "idle"),
+  (props.meta.lineTrail ?? []).filter((r) => {
+    if (!r.phase || r.phase === "idle") return false
+    if (r.hasSessionBuy === false) return false
+    if (r.exchangeFillConfirmed === false) return false
+    return true
+  }),
 )
 
 const phaseLabel: Record<string, string> = {
@@ -99,11 +122,11 @@ async function onStop() {
 
     <dl class="grid-card-stats">
       <div>
-        <dt>خطوط افتراضية</dt>
+        <dt>خطوط مسلّحة / تنفيذ</dt>
         <dd>
           {{ meta.ordersPlaced ?? 0 }}
           <span v-if="meta.virtualExecutions" class="fills-split muted">
-            · {{ meta.virtualExecutions }} تنفيذ
+            · {{ meta.virtualExecutions }} مملوء على المنصة
           </span>
         </dd>
       </div>
@@ -114,16 +137,28 @@ async function onStop() {
       <div :class="['stat-pnl', pnlClass(closedPnl)]">
         <dt>ربح مغلق</dt>
         <dd>{{ formatPnl(closedPnl, 4) }} USDT</dd>
-        <p class="pnl-hint">محدّث عبر WS عند كل بيع</p>
+        <p class="pnl-hint">بعد كل بيع</p>
+      </div>
+      <div :class="['stat-pnl', pnlClass(floatingPnl)]">
+        <dt>ربح عائم</dt>
+        <dd>{{ formatPnl(floatingPnl, 4) }} USDT</dd>
+        <p class="pnl-hint">يتحرك مع Mark</p>
+      </div>
+      <div :class="['stat-pnl', pnlClass(totalPnl)]">
+        <dt>إجمالي الجلسة</dt>
+        <dd>{{ formatPnl(totalPnl, 4) }} USDT</dd>
       </div>
       <div>
         <dt>تنفيذات</dt>
         <dd>
-          {{ sessionFills.count }}
-          <span v-if="sessionFills.count" class="fills-split muted">
-            · {{ sessionFills.buyCount }} شراء · {{ sessionFills.sellCount }} بيع
-          </span>
-          <span v-else class="fills-split muted"> · لا تنفيذ بعد</span>
+          <template v-if="sessionFills.count">
+            {{ sessionOrderCount }} أمر
+            <span class="fills-split muted"> · {{ sessionFills.count }} fill</span>
+            <span class="fills-split muted">
+              · {{ sessionFills.buyCount }} شراء · {{ sessionFills.sellCount }} بيع
+            </span>
+          </template>
+          <span v-else class="fills-split muted">لا تنفيذ بعد</span>
         </dd>
       </div>
       <div>
