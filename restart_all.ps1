@@ -67,4 +67,7 @@ Start-Process -FilePath $shell -WorkingDirectory $root -ArgumentList @(
 ) -WindowStyle Normal
 
 Write-Host "AlKarrar Pro: freed ports 8090 & 3000; API (uvicorn$(if (-not $NoApiReload) { ' +reload' })) + Nuxt dev starting in new windows."
-Write-Host "  API:      http://127.0.0.1:8090   |  UI: http://127.0.0.1:3000"
+Write-Host "  API:      http://127.0.0.1:8090   |  UI: http://localhost:3000"
+Write-Host "Waiting for Nuxt (first start may take ~60s)..."
+Start-Sleep -Seconds 12
+Start-Process "http://localhost:3000"

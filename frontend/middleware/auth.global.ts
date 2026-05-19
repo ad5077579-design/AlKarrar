@@ -10,6 +10,7 @@ export default defineNuxtRouteMiddleware(async (to) => {
       return navigateTo({ path: "/login", query: { redirect: to.fullPath } })
     }
   } catch {
-    return navigateTo("/login")
+    // API down or not started — do not block the UI (avoid redirect loop)
+    return
   }
 })
