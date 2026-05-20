@@ -16,17 +16,20 @@
 
 
 
+**أمر واحد فقط (موصى به):** من جذر المستودع:
+
 ```powershell
-
-# من جذر المستودع — يفضّل venv في .venv
-
-.\scripts\run_api.ps1      # FastAPI على http://127.0.0.1:8090
-
-.\scripts\run_frontend.ps1 # Nuxt على http://localhost:3000
-
+.\start.ps1
 ```
 
-**تشغيل موحّد (موصى به):** من جذر المستودع نفّذ `.\restart_all.ps1` — يفرِّغ المنافذ **8090** و**3000** ثم يفتح نافذتين لتشغيل الـ API (مع **`uvicorn --reload`** لتحميل مسارات جديدة تلقائياً، مثل `/audit`) والواجهة. لتعطيل إعادة تحميل الـ API: `.\restart_all.ps1 -NoApiReload`.
+يفرّغ المنافذ **8090** و**3000**، يفتح نافذتين (خلفية API + واجهة Nuxt)، ويفتح المتصفح على http://localhost:3000.  
+**إيقاف:** `.\stop.ps1` — أو `.\restart_all.ps1` / `.\start.ps1` (نفس التشغيل).
+
+```powershell
+.\start.ps1 -NoApiReload   # بدون uvicorn --reload
+```
+
+(للمطورين فقط — يدوياً: `.\scripts\run_api.ps1` + `.\scripts\run_frontend.ps1` — **لا حاجة** إذا استخدمت `.\start.ps1`.)
 
 
 

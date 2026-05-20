@@ -1,17 +1,30 @@
 <script setup lang="ts">
+import AuditLogPanel from "~/components/AuditLogPanel.vue"
 import BotAssignedActivityPanel from "~/components/BotAssignedActivityPanel.vue"
 import CompoundingRiskPanel from "~/components/CompoundingRiskPanel.vue"
+import DashboardCommandBar from "~/components/DashboardCommandBar.vue"
 import EmergencyBar from "~/components/EmergencyBar.vue"
-import { useBotStore } from "~/stores/bot"
+import PortfolioStrip from "~/components/PortfolioStrip.vue"
+import SymbolContextBar from "~/components/SymbolContextBar.vue"
+import { useBotStore, type DashboardTabId } from "~/stores/bot"
 
 const store = useBotStore()
+
+const dashboardLoaded = ref(false)
+
+const tabs: { id: DashboardTabId; label: string; hint: string }[] = [
+  { id: "watch", label: "مراقبة", hint: "شارت وحالة السوق" },
+  { id: "operate", label: "تشغيل", hint: "إعدادات الشبكة" },
+  { id: "logs", label: "سجلات", hint: "شبكات وصفقات" },
+]
 
 function closeTradesJournal() {
   store.tradesViewSymbol = null
 }
 
-/** Defer chart mount until dashboard (symbol + balances) is hydrated from the API. */
-const dashboardLoaded = ref(false)
+function setTab(id: DashboardTabId) {
+  store.setDashboardTab(id)
+}
 
 onMounted(async () => {
   store.connectWs()
@@ -43,17 +56,6 @@ onBeforeUnmount(() => {
             {{ store.activeGridSymbols.length === 1 ? "شبكة نشطة" : `${store.activeGridSymbols.length} شبكات` }}
           </span>
         </div>
-        <div class="header-meta">
-          <div class="conn" :class="{ ok: store.wsConnected, bad: !store.wsConnected }">
-            WS {{ store.wsConnected ? "live" : "offline" }}
-            <span v-if="store.lastWsAt && store.wsConnected" class="muted tiny">
-              · {{ new Date(store.lastWsAt).toLocaleTimeString() }}
-            </span>
-          </div>
-          <span v-if="store.credentialsConfigured" class="key-preview muted tiny">
-            {{ store.binanceApiKeyPreview }}
-          </span>
-        </div>
       </header>
 
       <div
@@ -83,13 +85,15 @@ onBeforeUnmount(() => {
 
       <EmergencyBar v-if="dashboardLoaded" />
 
-      <section class="balance-hero panel">
+      <DashboardCommandBar v-if="dashboardLoaded && store.credentialsConfigured" />
+
+      <section v-if="dashboardLoaded" class="balance-hero panel">
         <div class="balance-hero-head">
           <div>
             <h2>إجمالي Equity</h2>
             <p class="balance-source">
               <span v-if="store.balanceIsLive" class="live-dot" aria-hidden="true" />
-              Binance Spot · مباشر من API
+              Binance Spot · مباشر
               <span v-if="store.syncOkAt" class="sync-time">
                 · {{ new Date(store.syncOkAt).toLocaleTimeString() }}
               </span>
@@ -125,59 +129,93 @@ onBeforeUnmount(() => {
               }}</span>
             </div>
           </div>
-          <p v-if="store.balanceSyncState === 'pending'" class="balance-warn">
-            في انتظار مزامنة الرصيد الحي — لا يُعرض رصيد وهمي.
-          </p>
-          <p v-else-if="store.balanceSyncState === 'error'" class="balance-warn">
-            تعذّرت المزامنة — الرقم أعلاه غير متاح حتى يعود الاتصال بـ Binance.
-          </p>
         </div>
       </section>
 
-      <CompoundingRiskPanel v-if="dashboardLoaded && store.credentialsConfigured" />
+      <PortfolioStrip v-if="dashboardLoaded && store.credentialsConfigured" />
 
-      <section class="chart-wrap panel">
-        <h2 class="chart-title">الشموع — {{ store.symbol }} (15m)</h2>
-        <ClientOnly>
-          <TradingChart v-if="dashboardLoaded" :key="store.symbol" />
-          <div v-else class="chart-fallback">جاري تحميل الإعدادات والرسم…</div>
-          <template #fallback>
-            <div class="chart-fallback">جاري تحميل الرسم…</div>
-          </template>
-        </ClientOnly>
-      </section>
+      <nav v-if="dashboardLoaded" class="dash-tabs" role="tablist" aria-label="أقسام اللوحة">
+        <button
+          v-for="t in tabs"
+          :key="t.id"
+          type="button"
+          role="tab"
+          class="dash-tab"
+          :class="{ active: store.dashboardTab === t.id }"
+          :aria-selected="store.dashboardTab === t.id"
+          @click="setTab(t.id)"
+        >
+          <span class="tab-label">{{ t.label }}</span>
+          <span class="tab-hint">{{ t.hint }}</span>
+        </button>
+      </nav>
 
-      <GridSettingsPanel v-if="dashboardLoaded" />
+      <div v-if="dashboardLoaded" class="dash-panels">
+        <!-- مراقبة -->
+        <div
+          v-show="store.dashboardTab === 'watch'"
+          id="dash-tab-watch"
+          class="tab-panel"
+          role="tabpanel"
+        >
+          <SymbolContextBar v-if="store.credentialsConfigured" />
+          <section id="trading-chart-panel" class="chart-wrap panel">
+            <h2 class="section-title">الشموع — {{ store.symbol }} (15m)</h2>
+            <ClientOnly>
+              <TradingChart :key="store.symbol" />
+              <template #fallback>
+                <div class="chart-fallback">جاري تحميل الرسم…</div>
+              </template>
+            </ClientOnly>
+          </section>
+        </div>
 
-      <p
-        v-if="dashboardLoaded && store.credentialsConfigured && !store.showLiveBotPanels"
-        class="idle-hint muted"
-      >
-        لا شبكة نشطة ولا أوامر معلّقة — يمكنك تشغيل الشبكة من إعدادات Spot أدناه.
-      </p>
+        <!-- تشغيل -->
+        <div
+          v-show="store.dashboardTab === 'operate'"
+          id="dash-tab-operate"
+          class="tab-panel"
+          role="tabpanel"
+        >
+          <p
+            v-if="store.credentialsConfigured && !store.showLiveBotPanels"
+            class="idle-hint muted"
+          >
+            لا شبكة نشطة — عيّن النطاق والرأسمال ثم شغّل الشبكة من هنا.
+          </p>
+          <CompoundingRiskPanel v-if="store.credentialsConfigured" />
+          <GridSettingsPanel />
+        </div>
 
-      <ActiveGridCards v-if="dashboardLoaded && store.activeGridSymbols.length" />
+        <!-- سجلات -->
+        <div
+          v-show="store.dashboardTab === 'logs'"
+          id="dash-tab-logs"
+          class="tab-panel"
+          role="tabpanel"
+        >
+          <ActiveGridCards v-if="store.activeGridSymbols.length" />
 
-      <div
-        v-if="dashboardLoaded && store.tradesViewSymbol"
-        id="grid-trades-journal"
-      >
-        <TradeJournal
-          :symbol="store.tradesViewSymbol"
-          :since="store.gridsBySymbol[store.tradesViewSymbol]?.startedAt"
-          embedded
-          @close="closeTradesJournal"
-        />
+          <div v-if="store.tradesViewSymbol" id="grid-trades-journal">
+            <TradeJournal
+              :symbol="store.tradesViewSymbol"
+              :since="store.gridsBySymbol[store.tradesViewSymbol]?.startedAt"
+              embedded
+              @close="closeTradesJournal"
+            />
+          </div>
+
+          <AuditLogPanel v-if="store.credentialsConfigured" />
+
+          <BotAssignedActivityPanel
+            v-if="store.showLiveBotPanels && !store.activeGridSymbols.length"
+          />
+        </div>
       </div>
 
-      <BotAssignedActivityPanel
-        v-if="
-          dashboardLoaded &&
-          store.credentialsConfigured &&
-          store.showLiveBotPanels &&
-          !store.activeGridSymbols.length
-        "
-      />
+      <div v-else class="dash-loading panel">
+        <p class="muted">جاري تحميل اللوحة…</p>
+      </div>
     </main>
   </div>
 </template>
@@ -191,12 +229,12 @@ onBeforeUnmount(() => {
 .dash {
   flex: 1;
   min-width: 0;
-  max-width: 1200px;
+  max-width: 1280px;
   margin: 0 auto;
-  padding: 1rem 1.25rem 2rem;
+  padding: 1rem 1.25rem 2.5rem;
   display: flex;
   flex-direction: column;
-  gap: 1rem;
+  gap: 0.85rem;
 }
 @media (max-width: 960px) {
   .app-shell {
@@ -208,7 +246,6 @@ onBeforeUnmount(() => {
   align-items: center;
   justify-content: space-between;
   gap: 1rem;
-  flex-wrap: wrap;
 }
 .title-row {
   display: flex;
@@ -216,14 +253,11 @@ onBeforeUnmount(() => {
   gap: 0.65rem;
   flex-wrap: wrap;
 }
-.header-meta {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: 0.2rem;
-}
-.key-preview {
-  font-variant-numeric: tabular-nums;
+.dash-header h1 {
+  margin: 0;
+  font-size: 1.35rem;
+  font-weight: 800;
+  letter-spacing: -0.02em;
 }
 .spot-badge {
   font-size: 0.7rem;
@@ -274,33 +308,6 @@ onBeforeUnmount(() => {
     opacity: 0.65;
   }
 }
-.pnl-up {
-  color: #0ecb81;
-}
-.pnl-down {
-  color: #f6465d;
-}
-.metric-sm {
-  font-size: 1rem;
-}
-.tiny {
-  font-size: 0.72rem;
-  opacity: 0.85;
-}
-.dash-header h1 {
-  margin: 0;
-  font-size: 1.35rem;
-}
-.conn {
-  font-size: 0.85rem;
-  color: var(--muted);
-}
-.conn.ok {
-  color: var(--accent);
-}
-.conn.bad {
-  color: var(--warn);
-}
 .status-banner {
   background: rgba(246, 70, 93, 0.12);
   border: 1px solid rgba(246, 70, 93, 0.45);
@@ -331,12 +338,11 @@ onBeforeUnmount(() => {
   justify-content: space-between;
   gap: 0.75rem;
   flex-wrap: wrap;
-  margin-bottom: 0.75rem;
+  margin-bottom: 0.65rem;
 }
 .sym-pill {
   font-size: 0.75rem;
   font-weight: 700;
-  letter-spacing: 0.04em;
   padding: 0.25rem 0.6rem;
   border-radius: 999px;
   background: rgba(56, 189, 248, 0.12);
@@ -366,19 +372,18 @@ onBeforeUnmount(() => {
   background: #181a20;
   border: 1px solid #2b3139;
   border-radius: 8px;
-  padding: 1rem 1.15rem;
+  padding: 0.85rem 1rem;
 }
 .balance-primary {
   display: flex;
   align-items: baseline;
   gap: 0.4rem;
-  margin-bottom: 0.85rem;
+  margin-bottom: 0.65rem;
 }
 .balance-num {
-  font-size: 2rem;
+  font-size: 1.85rem;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
-  letter-spacing: -0.02em;
   color: #eaecef;
 }
 .balance-unit {
@@ -394,7 +399,7 @@ onBeforeUnmount(() => {
 .balance-sub {
   display: flex;
   flex-direction: column;
-  gap: 0.15rem;
+  gap: 0.12rem;
 }
 .sub-label {
   font-size: 0.68rem;
@@ -403,18 +408,76 @@ onBeforeUnmount(() => {
   color: #848e9c;
 }
 .sub-val {
-  font-size: 0.95rem;
+  font-size: 0.92rem;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
   color: #eaecef;
 }
-.balance-warn {
-  margin: 0.75rem 0 0;
-  font-size: 0.78rem;
-  color: #f0b90b;
-  line-height: 1.45;
+.dash-tabs {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0.4rem;
+  padding: 0.35rem;
+  border-radius: 12px;
+  background: #0f1318;
+  border: 1px solid var(--border);
 }
-.chart-title {
+.dash-tab {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.1rem;
+  padding: 0.55rem 0.5rem;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  background: transparent;
+  color: #94a3b8;
+  cursor: pointer;
+  transition:
+    background 0.2s ease,
+    color 0.2s ease,
+    border-color 0.2s ease;
+}
+.dash-tab:hover {
+  background: rgba(56, 189, 248, 0.08);
+  color: #e2e8f0;
+}
+.dash-tab.active {
+  background: linear-gradient(180deg, rgba(56, 189, 248, 0.18), rgba(56, 189, 248, 0.06));
+  border-color: rgba(56, 189, 248, 0.45);
+  color: #f1f5f9;
+}
+.tab-label {
+  font-size: 0.88rem;
+  font-weight: 700;
+}
+.tab-hint {
+  font-size: 0.62rem;
+  font-weight: 500;
+  opacity: 0.75;
+}
+.dash-panels {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+  animation: panel-in 0.25s ease;
+}
+@keyframes panel-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.tab-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+}
+.section-title {
   margin: 0 0 0.65rem;
   font-size: 0.95rem;
   font-weight: 600;
@@ -430,37 +493,11 @@ onBeforeUnmount(() => {
   justify-content: center;
   color: var(--muted);
 }
-.muted {
-  color: var(--muted);
-}
-.active-grids-title {
-  margin: 0 0 0.65rem;
-  font-size: 0.95rem;
-  font-weight: 600;
-  color: #e2e8f0;
-}
-.active-grids-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 0.45rem;
-}
-.active-grids-list li {
+.dash-loading {
+  min-height: 200px;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 0.75rem;
-  padding: 0.5rem 0.65rem;
-  border-radius: 8px;
-  background: rgba(34, 197, 94, 0.08);
-  border: 1px solid rgba(34, 197, 94, 0.25);
-}
-.ag-sym {
-  font-weight: 700;
-  font-size: 0.85rem;
-  letter-spacing: 0.03em;
+  justify-content: center;
 }
 .idle-hint {
   margin: 0;
@@ -470,5 +507,8 @@ onBeforeUnmount(() => {
   border-radius: 8px;
   background: rgba(43, 49, 57, 0.35);
   border: 1px solid rgba(43, 49, 57, 0.6);
+}
+.muted {
+  color: var(--muted);
 }
 </style>

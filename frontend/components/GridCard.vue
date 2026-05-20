@@ -17,11 +17,15 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   viewTrades: [symbol: string]
+  viewChart: [symbol: string]
   stop: [symbol: string]
 }>()
 
 const store = useBotStore()
 const stopping = ref(false)
+const isChartSymbol = computed(
+  () => store.symbol.trim().toUpperCase().replace("/", "") === props.symbol,
+)
 
 const pack = computed(() => store.symbolTradesPack(props.symbol))
 
@@ -105,12 +109,16 @@ async function onStop() {
     stopping.value = false
   }
 }
+
 </script>
 
 <template>
   <article
     class="grid-card"
-    :class="{ selected: store.tradesViewSymbol === symbol }"
+    :class="{
+      selected: store.tradesViewSymbol === symbol,
+      'chart-focus': isChartSymbol,
+    }"
   >
     <div class="grid-card-top">
       <div>
@@ -186,6 +194,14 @@ async function onStop() {
     <div class="grid-card-actions">
       <button
         type="button"
+        class="btn-card btn-chart"
+        :class="{ active: isChartSymbol }"
+        @click="emit('viewChart', symbol)"
+      >
+        {{ isChartSymbol ? "الشارت ✓" : "الشارت" }}
+      </button>
+      <button
+        type="button"
         class="btn-card btn-trades"
         :class="{ active: store.tradesViewSymbol === symbol }"
         @click="emit('viewTrades', symbol)"
@@ -212,6 +228,13 @@ async function onStop() {
 .grid-card.selected {
   border-color: rgba(56, 189, 248, 0.45);
   box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.12);
+}
+.grid-card.chart-focus {
+  border-color: rgba(14, 203, 129, 0.4);
+  box-shadow: 0 0 0 1px rgba(14, 203, 129, 0.1);
+}
+.grid-card.selected.chart-focus {
+  border-color: rgba(56, 189, 248, 0.55);
 }
 .grid-card-top {
   display: flex;
@@ -341,6 +364,15 @@ async function onStop() {
   font-weight: 600;
   background: #12161c;
   color: #e2e8f0;
+}
+.btn-card.btn-chart {
+  border-color: rgba(14, 203, 129, 0.35);
+  color: #34d399;
+}
+.btn-card.btn-chart.active {
+  border-color: #0ecb81;
+  color: #0ecb81;
+  background: rgba(14, 203, 129, 0.1);
 }
 .btn-card.btn-trades.active {
   border-color: #38bdf8;

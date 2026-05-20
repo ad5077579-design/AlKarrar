@@ -116,6 +116,34 @@ def test_validate_trailing_offset_rejects_tiny_offset():
         validate_trailing_offset(trailing_offset=0.0007, mark_price=86.0)
 
 
+def test_compute_grid_line_limits_spacing_cap():
+    from backend.api.spot_realized_ledger import compute_grid_line_limits
+
+    limits = compute_grid_line_limits(
+        generator_upper=1.006,
+        generator_lower=1.0,
+        allocated_capital=600.0,
+        generator_count=10,
+    )
+    assert limits["valid"] is True
+    assert int(limits["maxGeneratorCount"]) < 50
+    assert limits["limitingFactor"] == "spacing"
+
+
+def test_compute_grid_line_limits_capital_cap():
+    from backend.api.spot_realized_ledger import compute_grid_line_limits
+
+    limits = compute_grid_line_limits(
+        generator_upper=1.1,
+        generator_lower=1.0,
+        allocated_capital=100.0,
+        generator_count=5,
+    )
+    assert limits["valid"] is True
+    assert int(limits["maxFromCapital"]) == 9
+    assert int(limits["maxGeneratorCount"]) <= 9
+
+
 def test_validate_grid_economics_rejects_tight_band():
     from backend.api.spot_realized_ledger import validate_grid_economics
 

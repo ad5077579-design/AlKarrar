@@ -38,6 +38,10 @@ const journalSym = computed(() => {
 
 const pack = computed(() => store.symbolTradesPack(journalSym.value))
 
+const gridMeta = computed(() =>
+  props.symbol ? store.gridsBySymbol[journalSym.value] : store.selectedGridMeta,
+)
+
 const sessionRows = computed(() => {
   const rows = props.symbol ? pack.value.trades : store.trades
   if (props.since?.trim()) {
@@ -240,6 +244,16 @@ onBeforeUnmount(() => {
         </button>
       </div>
     </header>
+
+    <p
+      v-if="since && !journalLoading && displayRows.length === 0 && gridMeta?.virtualGrid"
+      class="journal-hint"
+      role="status"
+    >
+      شبكة افتراضية على {{ journalSym }}: لا fills في سجل Binance بعد (
+      {{ gridMeta?.virtualExecutions ?? 0 }} تنفيذ، {{ gridMeta?.ordersPlaced ?? 0 }} خط مسلّح).
+      أحداث التشغيل في «سجل تدقيق الشبكة» — علامات الشارت عند أول شراء/بيع (Spot أو سجل التدقيق).
+    </p>
 
     <p v-if="journalError" class="journal-err" role="alert">{{ journalError }}</p>
     <p v-else-if="journalSyncError" class="journal-warn" role="status">
@@ -470,6 +484,16 @@ button.btn-close {
 button.btn-close:hover {
   color: #e2e8f0;
   border-color: #5c6573;
+}
+.journal-hint {
+  margin: 0 0 0.65rem;
+  padding: 0.5rem 0.65rem;
+  font-size: 0.78rem;
+  line-height: 1.45;
+  color: #cbd5e1;
+  background: rgba(56, 189, 248, 0.08);
+  border: 1px solid rgba(56, 189, 248, 0.28);
+  border-radius: 8px;
 }
 .journal-err {
   margin: 0;

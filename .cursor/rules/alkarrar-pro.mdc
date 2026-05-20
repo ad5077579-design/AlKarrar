@@ -9,7 +9,7 @@ alwaysApply: true
 
 ## قواعد سريعة
 
-- **Stack:** FastAPI `backend/api` (port **8090**) + Nuxt 3 `frontend/` (port **3000**). تشغيل يدوي: `scripts/run_api.ps1`, `scripts/run_frontend.ps1` — أو **موحّد:** `restart_all.ps1` (جذر المشروع) يفرّغ المنافذ ويشغِّل الاثنين؛ الـ API افتراضياً مع `--reload` لمطابقة كود جديد.
+- **Stack:** FastAPI `backend/api` (port **8090**) + Nuxt 3 `frontend/` (port **3000**). **تشغيل واحد:** `.\start.ps1` من جذر المشروع (خلفية + واجهة). إيقاف: `.\stop.ps1`.
 - **تطوير:** `apiBase` و `wsUrl` فارغان → `/api` و `/ws` عبر proxy إلى `127.0.0.1:8090` (`nuxt.config.ts`).
 - **بيئة Spot:** `BINANCE_ENV` = `mainnet` | `testnet` | `demo` في `.env` (افتراضي المثال: **demo** من demo.binance.com). بدونها: `BINANCE_TESTNET=true` → testnet.
 - **عميل:** `BinanceSpotClient.create_for_env(env=...)` + `get_binance_keys(bot_id)` → `env`. التوجيه في `backend/core/binance_env.py`.

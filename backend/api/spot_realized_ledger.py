@@ -19,6 +19,7 @@ _log = logging.getLogger(__name__)
 
 MIN_USDT_PER_LINE_DEFAULT = 11.0
 MIN_LINE_SPACING_PCT_DEFAULT = 0.0015  # 0.15% — covers ~0.1% fee × 2
+ABSOLUTE_MAX_GENERATOR_COUNT = 64
 
 
 def _f(x: Any, default: float = 0.0) -> float:
@@ -320,6 +321,88 @@ def journal_row_to_ledger_row(row: dict[str, Any]) -> dict[str, Any] | None:
         except (TypeError, ValueError):
             return None
     return normalize_trade_row_for_ledger(merged)
+
+
+def compute_grid_line_limits(
+    *,
+    generator_upper: float,
+    generator_lower: float,
+    allocated_capital: float,
+    generator_count: int | None = None,
+    min_usdt_per_line: float = MIN_USDT_PER_LINE_DEFAULT,
+    min_line_spacing_pct: float = MIN_LINE_SPACING_PCT_DEFAULT,
+    absolute_max_count: int = ABSOLUTE_MAX_GENERATOR_COUNT,
+) -> dict[str, float | int | bool | str]:
+    """
+    Max ``generatorCount`` allowed by line spacing (band width) and per-line USDT floor.
+  """
+    upper = float(generator_upper)
+    lower = float(generator_lower)
+    alloc = float(allocated_capital)
+    count = max(2, int(generator_count)) if generator_count is not None else 2
+    base: dict[str, float | int | bool | str] = {
+        "valid": False,
+        "maxGeneratorCount": 2,
+        "minGeneratorCount": 2,
+        "maxFromSpacing": 2,
+        "maxFromCapital": 2,
+        "limitingFactor": "range",
+        "bandSpanPct": 0.0,
+        "lineSpacingPct": 0.0,
+        "usdtPerLine": 0.0,
+        "minUsdtPerLine": float(min_usdt_per_line),
+        "minLineSpacingPct": round(float(min_line_spacing_pct) * 100.0, 4),
+        "economicsOk": False,
+        "generatorCount": count,
+        "absoluteMaxGeneratorCount": int(absolute_max_count),
+    }
+    if alloc <= 0 or not (lower < upper):
+        return base
+
+    mid = (upper + lower) / 2.0
+    if mid <= 0:
+        return base
+
+    span_pct = (upper - lower) / mid
+    if min_line_spacing_pct > 0:
+        max_from_spacing = int(span_pct / min_line_spacing_pct) + 1
+    else:
+        max_from_spacing = int(absolute_max_count)
+    if min_usdt_per_line > 0:
+        max_from_capital = int(alloc / min_usdt_per_line)
+    else:
+        max_from_capital = int(absolute_max_count)
+
+    max_from_spacing = max(2, max_from_spacing)
+    max_from_capital = max(2, max_from_capital)
+    max_count = min(max_from_spacing, max_from_capital, int(absolute_max_count))
+    max_count = max(2, max_count)
+
+    if max_count >= int(absolute_max_count):
+        limiting = "platform_cap"
+    elif max_from_spacing <= max_from_capital:
+        limiting = "spacing"
+    else:
+        limiting = "capital"
+
+    spacing_at = span_pct / max(count - 1, 1)
+    usdt_at = alloc / count
+    economics_ok = spacing_at >= min_line_spacing_pct and usdt_at >= min_usdt_per_line
+
+    base.update(
+        {
+            "valid": True,
+            "maxGeneratorCount": max_count,
+            "maxFromSpacing": max_from_spacing,
+            "maxFromCapital": max_from_capital,
+            "limitingFactor": limiting,
+            "bandSpanPct": round(span_pct * 100.0, 4),
+            "lineSpacingPct": round(spacing_at * 100.0, 4),
+            "usdtPerLine": round(usdt_at, 4),
+            "economicsOk": economics_ok,
+        }
+    )
+    return base
 
 
 def validate_grid_economics(

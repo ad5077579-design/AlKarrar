@@ -109,18 +109,17 @@ python scripts/test_binance_spot_keys.py
 
 ### 3. Run (Windows)
 
-```powershell
-.\restart_all.ps1
-```
-
-Or separately:
+**One command** (backend + frontend):
 
 ```powershell
-.\scripts\run_api.ps1      # http://127.0.0.1:8090
-.\scripts\run_frontend.ps1 # http://127.0.0.1:3000
+.\start.ps1
 ```
 
-Open **http://127.0.0.1:3000** — API and WebSocket are proxied via Nuxt in development.
+Stop: `.\stop.ps1` — or double-click `start.bat`.
+
+Opens two PowerShell windows (API on **8090**, UI on **3000**) and the browser. Same as `.\restart_all.ps1`.
+
+Open **http://localhost:3000** — API and WebSocket are proxied via Nuxt in development.
 
 ### 4. Run tests
 

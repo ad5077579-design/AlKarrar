@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, onBeforeUnmount, ref } from "vue"
+import { computed, onMounted, onBeforeUnmount, ref, watch } from "vue"
+import SuggestedSymbolsPanel from "~/components/SuggestedSymbolsPanel.vue"
 import { useBotStore, type MarketSymbol } from "~/stores/bot"
 
 const store = useBotStore()
@@ -36,6 +37,7 @@ function formatVol(n: number): string {
 async function onPick(row: MarketSymbol) {
   if (row.symbol === store.symbol || selecting.value) return
   selecting.value = row.symbol
+  store.setDashboardTab("watch")
   try {
     await store.selectSymbol(row.symbol)
   } catch (e) {
@@ -51,10 +53,20 @@ async function onPick(row: MarketSymbol) {
 
 onMounted(() => {
   void store.fetchMarkets()
+  if (store.credentialsConfigured) {
+    void store.fetchSymbolSuggestions()
+  }
   refreshTimer = setInterval(() => {
     void store.fetchMarkets()
   }, 45_000)
 })
+
+watch(
+  () => store.credentialsConfigured,
+  (ok) => {
+    if (ok) void store.fetchSymbolSuggestions()
+  },
+)
 
 onBeforeUnmount(() => {
   if (refreshTimer) clearInterval(refreshTimer)
@@ -87,6 +99,8 @@ onBeforeUnmount(() => {
       placeholder="بحث (BTC, DOGE…)"
       autocomplete="off"
     />
+
+    <SuggestedSymbolsPanel />
 
     <p v-if="store.marketsError" class="markets-err" role="alert">{{ store.marketsError }}</p>
 
@@ -228,7 +242,7 @@ onBeforeUnmount(() => {
   overflow-y: auto;
   flex: 1;
   min-height: 120px;
-  max-height: calc(100vh - 11rem);
+  max-height: calc(100vh - 22rem);
   scrollbar-width: thin;
   scrollbar-color: #2a3340 transparent;
 }

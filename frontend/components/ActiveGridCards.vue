@@ -26,7 +26,24 @@ async function onStop(sym: string) {
 function onViewTrades(sym: string) {
   store.openTradesForSymbol(sym)
   nextTick(() => {
-    document.getElementById("grid-trades-journal")?.scrollIntoView({ behavior: "smooth", block: "start" })
+    document.getElementById("dash-tab-logs")?.scrollIntoView({ behavior: "smooth", block: "start" })
+  })
+}
+
+async function onViewChart(sym: string) {
+  const normalized = sym.trim().toUpperCase().replace("/", "")
+  store.setDashboardTab("watch")
+  if (normalized !== store.symbol.trim().toUpperCase().replace("/", "")) {
+    try {
+      await store.selectSymbol(normalized)
+    } catch (e) {
+      alert(String(e))
+      return
+    }
+  }
+  void store.fetchGridLedger(normalized)
+  nextTick(() => {
+    document.getElementById("trading-chart-panel")?.scrollIntoView({ behavior: "smooth", block: "start" })
   })
 }
 
@@ -63,6 +80,7 @@ onBeforeUnmount(() => {
         :symbol="sym"
         :meta="store.gridsBySymbol[sym] ?? {}"
         @view-trades="onViewTrades"
+        @view-chart="onViewChart"
         @stop="onStop"
       />
     </div>

@@ -4,6 +4,8 @@ import {
   createSeriesMarkers,
   LineSeries,
   CandlestickSeries,
+  BaselineSeries,
+  HistogramSeries,
   ColorType,
 } from "lightweight-charts"
 import type {
@@ -12,12 +14,31 @@ import type {
   ISeriesApi,
   ISeriesMarkersPluginApi,
   LogicalRangeChangeEventHandler,
+  MouseEventParams,
   UTCTimestamp,
   CandlestickData,
   Time,
 } from "lightweight-charts"
 import { useBotStore } from "~/stores/bot"
-import { buildTradeMarkers, mergeTradesForSymbol } from "~/utils/chartTradeMarkers"
+import {
+  buildLedgerFillMarkers,
+  buildTradeActivityHistogram,
+  buildTradeMarkers,
+  chartTradesForSymbol,
+  formatChartPrice,
+  tradeSummaryForSymbol,
+} from "~/utils/chartTradeMarkers"
+import {
+  buildSessionBandPoints,
+  envHostHint,
+  envTradingLabelAr,
+  formatSessionDuration,
+  markFeedAgeSec,
+  normalizeSpotEnv,
+  sessionBackdropColors,
+  sessionStartSec,
+  type SpotEnvKind,
+} from "~/utils/chartLiveLayer"
 
 const store = useBotStore()
 const cfg = useRuntimeConfig()
@@ -25,6 +46,20 @@ const root = ref<HTMLDivElement | null>(null)
 const klinesError = ref<string | null>(null)
 /** Cleared in ``finally`` after every klines fetch (success, error, or empty). */
 const isLoading = ref(true)
+const showTrades = ref(true)
+const showBand = ref(true)
+const showVolume = ref(true)
+const showGridLines = ref(true)
+/** طبقة جلسة التداول الحي على الشارت (حسب بيئة المنصة). */
+const showLiveLayer = ref(true)
+const liveClock = ref(Date.now())
+let liveClockTimer: ReturnType<typeof setInterval> | null = null
+const crosshairTip = ref<{ visible: boolean; x: number; y: number; text: string }>({
+  visible: false,
+  x: 0,
+  y: 0,
+  text: "",
+})
 
 /** Must match ``interval`` query to ``/klines`` (seconds per bar). */
 const KLINES_INTERVAL = "15m"
@@ -37,6 +72,12 @@ let chart: IChartApi | null = null
 let candleSeries: ISeriesApi<"Candlestick"> | null = null
 let lineSeries: ISeriesApi<"Line"> | null = null
 let tradeMarkers: ISeriesMarkersPluginApi<Time> | null = null
+let bandSeries: ISeriesApi<"Baseline"> | null = null
+/** Session window fill — created before candles so it stays behind OHLC. */
+let sessionBandSeries: ISeriesApi<"Baseline"> | null = null
+let klineVolumeSeries: ISeriesApi<"Histogram"> | null = null
+let tradeFlowSeries: ISeriesApi<"Histogram"> | null = null
+const volumeByTime = new Map<number, number>()
 /** Series that owns generator / grid price lines */
 let priceLineHost: ISeriesApi<"Candlestick"> | ISeriesApi<"Line"> | null = null
 const priceLines = shallowRef<object[]>([])
@@ -46,6 +87,9 @@ let viewportLockedByUser = false
 let suppressViewportLock = false
 let onVisibleLogicalRangeChange: LogicalRangeChangeEventHandler | null = null
 let onChartWheel: (() => void) | null = null
+let onCrosshairMove: ((p: MouseEventParams<Time>) => void) | null = null
+
+const VOLUME_SCALE_ID = "volume"
 
 const MARK_LINE_SERIES_OPTS = {
   color: "#38bdf8",
@@ -96,6 +140,83 @@ function tradePriceAutoscaleInfo(): AutoscaleInfo | null {
 
 const AUTOSCALE_FROM_CANDLES = () => tradePriceAutoscaleInfo()
 
+const gridMetaHere = computed(() => store.selectedGridMeta)
+
+const chartSessionSince = computed(() => {
+  if (!store.isGridActiveForSelectedSymbol) return ""
+  return gridMetaHere.value?.startedAt?.trim() ?? ""
+})
+
+const tradeStats = computed(() => {
+  const sym = resolveKlinesSymbol()
+  const pack = store.symbolTradesPack(sym)
+  const merged = chartTradesForSymbol(sym, pack.trades, store.trades, chartSessionSince.value)
+  return tradeSummaryForSymbol(merged, sym)
+})
+
+const markInsideBand = computed(() => {
+  const m = store.markPrice
+  const hi = store.generatorUpper
+  const lo = store.generatorLower
+  return hi > lo && m >= lo && m <= hi
+})
+
+const spotEnv = computed((): SpotEnvKind =>
+  normalizeSpotEnv(store.binanceEnv, store.exchangeTestnet),
+)
+
+const sessionStart = computed(() => sessionStartSec(gridMetaHere.value?.startedAt))
+
+const openOrdersOnSymbol = computed(() => {
+  const sym = resolveKlinesSymbol()
+  return store.orders.filter(
+    (o) => String((o as Record<string, unknown>).symbol ?? "").toUpperCase() === sym,
+  ).length
+})
+
+const liveStrip = computed(() => {
+  liveClock.value
+  const env = spotEnv.value
+  const sym = resolveKlinesSymbol()
+  const gridHere = store.isGridActiveForSelectedSymbol
+  const otherGrids = store.otherActiveGridSymbols.length
+  const wsOk = store.wsConnected
+  const feedSec = markFeedAgeSec(store.lastWsAt)
+  const feedStale = !wsOk || (feedSec != null && feedSec > 25)
+  const balanceLive = store.balanceIsLive
+  const start = sessionStart.value
+  const meta = gridMetaHere.value
+  const sessionPnl = Number(meta?.sessionRealizedUsdt ?? 0)
+  const alloc = Number(meta?.allocatedCapital ?? store.allocatedCapital ?? 0)
+
+  let mode: "idle" | "live" | "other" | "orders" = "idle"
+  if (gridHere) mode = "live"
+  else if (otherGrids > 0) mode = "other"
+  else if (openOrdersOnSymbol.value > 0) mode = "orders"
+
+  return {
+    env,
+    envLabel: envTradingLabelAr(env),
+    host: envHostHint(env),
+    mode,
+    sym,
+    wsOk,
+    feedSec,
+    feedStale,
+    balanceLive,
+    gridHere,
+    otherGrids,
+    start,
+    sessionDur: start != null ? formatSessionDuration(start) : "",
+    sessionPnl,
+    alloc,
+    orders: openOrdersOnSymbol.value,
+    virtualExec: Number(meta?.virtualExecutions ?? 0),
+    placed: Number(meta?.ordersPlaced ?? 0),
+    isMainnet: env === "mainnet",
+  }
+})
+
 function seriesForPriceLines() {
   return priceLineHost
 }
@@ -138,7 +259,21 @@ function rebuildPriceLines() {
       }),
     )
   }
-  const levels = store.gridLevels
+  const levels = showGridLines.value ? store.gridLevels : []
+  const mid =
+    Number.isFinite(hi) && Number.isFinite(lo) && hi > lo ? (hi + lo) / 2 : 0
+  if (mid > 0) {
+    next.push(
+      s.createPriceLine({
+        price: mid,
+        color: "rgba(240, 185, 11, 0.75)",
+        lineWidth: 1,
+        lineStyle: 2,
+        axisLabelVisible: true,
+        title: "mid",
+      }),
+    )
+  }
   for (let i = 1; i < levels.length - 1; i++) {
     const p = levels[i]
     if (!Number.isFinite(p)) continue
@@ -235,6 +370,7 @@ function bucketMarkSeries(data: { time: number; value: number }[]) {
 }
 
 function parseKlinesPayload(rows: unknown): CandlestickData<Time>[] {
+  volumeByTime.clear()
   if (!Array.isArray(rows)) return []
   const parsed: CandlestickData<Time>[] = []
   for (const raw of rows) {
@@ -245,6 +381,7 @@ function parseKlinesPayload(rows: unknown): CandlestickData<Time>[] {
       const high = Number(raw[2])
       const low = Number(raw[3])
       const close = Number(raw[4])
+      const volume = Number(raw[5])
       if (
         !Number.isFinite(t) ||
         !Number.isFinite(open) ||
@@ -255,6 +392,7 @@ function parseKlinesPayload(rows: unknown): CandlestickData<Time>[] {
         continue
       }
       parsed.push({ time: t as UTCTimestamp, open, high, low, close })
+      if (Number.isFinite(volume) && volume > 0) volumeByTime.set(t, volume)
       continue
     }
     if (!raw || typeof raw !== "object") continue
@@ -274,6 +412,7 @@ function parseKlinesPayload(rows: unknown): CandlestickData<Time>[] {
     ) {
       continue
     }
+    const volume = Number(r.volume ?? (Array.isArray(raw) && raw.length > 5 ? raw[5] : 0))
     parsed.push({
       time: t as UTCTimestamp,
       open,
@@ -281,6 +420,9 @@ function parseKlinesPayload(rows: unknown): CandlestickData<Time>[] {
       low,
       close,
     })
+    if (Number.isFinite(volume) && volume > 0) {
+      volumeByTime.set(t, volume)
+    }
   }
   parsed.sort((a, b) => (a.time as number) - (b.time as number))
   const dedup: CandlestickData<Time>[] = []
@@ -295,8 +437,139 @@ function parseKlinesPayload(rows: unknown): CandlestickData<Time>[] {
   return dedup
 }
 
+function applyMarkLineStyle() {
+  if (!lineSeries) return
+  const inBand = markInsideBand.value
+  lineSeries.applyOptions({
+    color: inBand ? "#38bdf8" : "#f59e0b",
+    title: inBand ? "Mark" : "Mark (خارج النطاق)",
+  })
+}
+
+function syncBandArea() {
+  if (!chart) return
+  const hi = store.generatorUpper
+  const lo = store.generatorLower
+  if (!showBand.value || !(hi > lo) || syncedCandles.length === 0) {
+    if (bandSeries) {
+      bandSeries.setData([])
+    }
+    return
+  }
+  if (!bandSeries) {
+    bandSeries = chart.addSeries(BaselineSeries, {
+      baseValue: { type: "price", price: lo },
+      topFillColor1: "rgba(14, 203, 129, 0.22)",
+      topFillColor2: "rgba(14, 203, 129, 0.06)",
+      bottomFillColor1: "rgba(14, 203, 129, 0.02)",
+      bottomFillColor2: "rgba(14, 203, 129, 0.02)",
+      lineVisible: false,
+      lastValueVisible: false,
+      priceLineVisible: false,
+      crosshairMarkerVisible: false,
+      priceScaleId: "right",
+    })
+  } else {
+    bandSeries.applyOptions({ baseValue: { type: "price", price: lo } })
+  }
+  bandSeries.setData(
+    syncedCandles.map((c) => ({
+      time: c.time,
+      value: hi,
+    })),
+  )
+}
+
+function ensureSessionBandSeries() {
+  if (!chart || sessionBandSeries) return
+  const lo = Math.max(store.generatorLower || 0, 1e-12)
+  sessionBandSeries = chart.addSeries(BaselineSeries, {
+    baseValue: { type: "price", price: lo },
+    lineVisible: false,
+    lastValueVisible: false,
+    priceLineVisible: false,
+    crosshairMarkerVisible: false,
+    priceScaleId: "right",
+    ...sessionBackdropColors(spotEnv.value),
+  })
+}
+
+function syncSessionBackdrop() {
+  if (!chart) return
+  const hi = store.generatorUpper
+  const lo = store.generatorLower
+  const start = sessionStart.value
+  const active = store.isGridActiveForSelectedSymbol && start != null
+
+  if (!showLiveLayer.value || !active || !(hi > lo) || syncedCandles.length === 0) {
+    sessionBandSeries?.setData([])
+    return
+  }
+
+  ensureSessionBandSeries()
+  if (!sessionBandSeries) return
+
+  const colors = sessionBackdropColors(spotEnv.value)
+  sessionBandSeries.applyOptions({
+    baseValue: { type: "price", price: lo },
+    ...colors,
+  })
+  sessionBandSeries.setData(buildSessionBandPoints(syncedCandles, hi, start))
+}
+
+function syncVolumePanels() {
+  if (!chart) return
+  const show = showVolume.value && syncedCandles.length > 0
+  if (!show) {
+    klineVolumeSeries?.setData([])
+    tradeFlowSeries?.setData([])
+    return
+  }
+  if (!klineVolumeSeries) {
+    klineVolumeSeries = chart.addSeries(HistogramSeries, {
+      priceScaleId: VOLUME_SCALE_ID,
+      priceFormat: { type: "volume" },
+      color: "rgba(148, 163, 184, 0.35)",
+    })
+    tradeFlowSeries = chart.addSeries(HistogramSeries, {
+      priceScaleId: VOLUME_SCALE_ID,
+      priceFormat: { type: "volume" },
+    })
+    chart.priceScale(VOLUME_SCALE_ID).applyOptions({
+      scaleMargins: { top: 0.82, bottom: 0 },
+      borderVisible: false,
+    })
+    chart.priceScale("right").applyOptions({
+      scaleMargins: { top: 0.06, bottom: 0.24 },
+    })
+  }
+  const volData = syncedCandles.map((c) => {
+    const t = c.time as number
+    const v = volumeByTime.get(t) ?? 0
+    return {
+      time: c.time,
+      value: v,
+      color: "rgba(148, 163, 184, 0.4)",
+    }
+  })
+  klineVolumeSeries.setData(volData)
+
+  const sym = resolveKlinesSymbol()
+  const pack = store.symbolTradesPack(sym)
+  const merged = chartTradesForSymbol(sym, pack.trades, store.trades, chartSessionSince.value)
+  const { min, max } = candleTimeBounds()
+  const flow = buildTradeActivityHistogram(merged, {
+    symbol: sym,
+    intervalSec: KLINES_INTERVAL_SEC,
+    minTimeSec: min,
+    maxTimeSec: max,
+  })
+  tradeFlowSeries.setData(flow)
+}
+
 function applyMarkData() {
   if (!lineSeries) return
+  applyMarkLineStyle()
   const pts = bucketMarkSeries(store.markSeriesData)
   if (pts.length === 0) {
     const bucket = bucketStart(Math.floor(Date.now() / 1000)) as UTCTimestamp
@@ -399,6 +672,7 @@ function updateLiveCandleFromMark(price: number) {
     syncedCandles.push(next)
     candleSeries.update(next)
     if (syncedCandles.length > 320) syncedCandles.splice(0, syncedCandles.length - 320)
+    syncSessionBackdrop()
   }
 }
 
@@ -425,6 +699,9 @@ function ensureCandleSeries(candles: CandlestickData<Time>[]) {
     updateLiveCandleFromMark(store.markPrice)
     ensureTradeMarkersPlugin()
     applyTradeMarkers()
+    syncBandArea()
+    syncSessionBackdrop()
+    syncVolumePanels()
   } catch (e) {
     klinesError.value = `lightweight-charts: ${String(e)}`
   }
@@ -452,18 +729,67 @@ function ensureTradeMarkersPlugin() {
 
 function applyTradeMarkers() {
   if (!tradeMarkers || !candleSeries) return
+  if (!showTrades.value) {
+    tradeMarkers.setMarkers([])
+    return
+  }
   const sym = resolveKlinesSymbol()
   const pack = store.symbolTradesPack(sym)
-  const merged = mergeTradesForSymbol(sym, pack.trades, store.trades)
+  const merged = chartTradesForSymbol(sym, pack.trades, store.trades, chartSessionSince.value)
   const { min, max } = candleTimeBounds()
-  const markers = buildTradeMarkers(merged, {
+  const sessionMs = chartSessionSince.value ? Date.parse(chartSessionSince.value) : 0
+  let markers = buildTradeMarkers(merged, {
     symbol: sym,
     intervalSec: KLINES_INTERVAL_SEC,
     minTimeSec: min,
     maxTimeSec: max,
     limit: 250,
   })
+  if (markers.length === 0) {
+    const ledger = store.gridLedgerPack(sym)
+    if (ledger?.entries?.length) {
+      markers = buildLedgerFillMarkers(ledger.entries, {
+        symbol: sym,
+        intervalSec: KLINES_INTERVAL_SEC,
+        minTimeSec: min,
+        maxTimeSec: max,
+        sessionStartMs: sessionMs > 0 ? sessionMs : undefined,
+      })
+    }
+  }
   tradeMarkers.setMarkers(markers)
+  syncVolumePanels()
+}
+
+function bindCrosshairLegend() {
+  if (!chart || !root.value) return
+  if (onCrosshairMove) {
+    chart.unsubscribeCrosshairMove(onCrosshairMove)
+  }
+  onCrosshairMove = (param: MouseEventParams<Time>) => {
+    if (!param.point || !param.time || param.point.x < 0 || param.point.y < 0) {
+      crosshairTip.value = { ...crosshairTip.value, visible: false }
+      return
+    }
+    const t = param.time as number
+    const candle = syncedCandles.find((c) => (c.time as number) === t)
+    const close = candle ? (candle.close as number) : store.markPrice
+    const hi = store.generatorUpper
+    const lo = store.generatorLower
+    let bandTxt = ""
+    if (hi > lo && close > 0) {
+      if (close > hi) bandTxt = " · فوق القمة"
+      else if (close < lo) bandTxt = " · تحت القاع"
+      else bandTxt = " · داخل النطاق"
+    }
+    crosshairTip.value = {
+      visible: true,
+      x: param.point.x + 12,
+      y: param.point.y - 8,
+      text: `${formatChartPrice(close)}${bandTxt}`,
+    }
+  }
+  chart.subscribeCrosshairMove(onCrosshairMove)
 }
 
 async function loadTradesForChart() {
@@ -484,7 +810,7 @@ onMounted(async () => {
 
   chart = createChart(root.value, {
     autoSize: true,
-    height: 420,
+    height: 448,
     layout: {
       background: { type: ColorType.Solid, color: "#0b0e11" },
       textColor: "#c9d4e0",
@@ -520,6 +846,7 @@ onMounted(async () => {
   })
 
   // Do not call ``applyOptions({ width })`` while ``autoSize: true`` — lightweight-charts throws.
+  ensureSessionBandSeries()
   ensureCandleSeries(candles)
 
   lineSeries = chart.addSeries(LineSeries, {
@@ -527,9 +854,14 @@ onMounted(async () => {
     autoscaleInfoProvider: AUTOSCALE_FROM_CANDLES,
   })
   bindViewportLockHandlers()
+  bindCrosshairLegend()
   rebuildPriceLinesAfterSeriesReady()
   applyMarkData()
   void loadTradesForChart()
+
+  liveClockTimer = globalThis.setInterval(() => {
+    liveClock.value = Date.now()
+  }, 30_000)
 
   if (candles.length === 0 && !klinesError.value) {
     klinesRetryTimer = globalThis.setTimeout(async () => {
@@ -550,11 +882,36 @@ watch(
     store.generatorLower,
     store.generatorCount,
     store.gridLevels.join(","),
+    showGridLines.value,
+    showBand.value,
   ],
   () => {
     rebuildPriceLinesAfterSeriesReady()
+    syncBandArea()
+    syncSessionBackdrop()
+    applyMarkLineStyle()
   },
 )
+
+watch(
+  () => [
+    showLiveLayer.value,
+    store.isGridActiveForSelectedSymbol,
+    gridMetaHere.value?.startedAt ?? "",
+    store.binanceEnv,
+    store.exchangeTestnet,
+    store.generatorUpper,
+    store.generatorLower,
+  ],
+  () => syncSessionBackdrop(),
+)
+
+watch([showTrades, showVolume], () => {
+  applyTradeMarkers()
+  syncVolumePanels()
+})
+
+watch(showBand, () => syncBandArea())
 
 watch(
   () => store.markSeriesData,
@@ -570,8 +927,11 @@ watch(
   () => {
     applyMarkData()
     updateLiveCandleFromMark(store.markPrice)
+    applyMarkLineStyle()
   },
 )
+
+watch(markInsideBand, () => applyMarkLineStyle())
 
 async function reloadChartForSymbol() {
   if (!chart) return
@@ -617,6 +977,8 @@ watch(
       store.trades.length,
       store.tradesBySymbol[sym]?.trades?.length ?? 0,
       store.tradesBySymbol[sym]?.updatedAt ?? "",
+      store.gridLedgerBySymbol[sym]?.entries?.length ?? 0,
+      chartSessionSince.value,
     ]
   },
   () => {
@@ -626,11 +988,19 @@ watch(
 
 onBeforeUnmount(() => {
   isLoading.value = false
+  if (liveClockTimer) {
+    clearInterval(liveClockTimer)
+    liveClockTimer = null
+  }
   if (klinesRetryTimer) {
     clearTimeout(klinesRetryTimer)
     klinesRetryTimer = null
   }
   unbindViewportLockHandlers()
+  if (chart && onCrosshairMove) {
+    chart.unsubscribeCrosshairMove(onCrosshairMove)
+    onCrosshairMove = null
+  }
   clearPriceLines()
   tradeMarkers?.detach()
   tradeMarkers = null
@@ -639,8 +1009,13 @@ onBeforeUnmount(() => {
   viewportLockedByUser = false
   candleSeries = null
   lineSeries = null
+  bandSeries = null
+  sessionBandSeries = null
+  klineVolumeSeries = null
+  tradeFlowSeries = null
   priceLineHost = null
   syncedCandles = []
+  volumeByTime.clear()
 })
 </script>
 
@@ -651,14 +1026,104 @@ onBeforeUnmount(() => {
         إعادة ضبط التكبير
       </button>
       <span class="chart-legend">
-        <span class="legend-item buy">▲ شراء</span>
-        <span class="legend-item sell">▼ بيع</span>
+        <span class="legend-item buy">● شراء</span>
+        <span class="legend-item sell">■ بيع</span>
+        <span class="legend-item mark" :class="{ out: !markInsideBand }">— Mark</span>
       </span>
-      <span class="chart-hint muted">عجلة الفأرة: تكبير · سحب: تحريك</span>
+      <label class="layer-toggle"><input v-model="showTrades" type="checkbox" /> صفقات</label>
+      <label class="layer-toggle"><input v-model="showBand" type="checkbox" /> نطاق</label>
+      <label class="layer-toggle"><input v-model="showGridLines" type="checkbox" /> خطوط</label>
+      <label class="layer-toggle"><input v-model="showVolume" type="checkbox" /> حجم</label>
+      <label class="layer-toggle"><input v-model="showLiveLayer" type="checkbox" /> طبقة حية</label>
+      <span class="chart-stats muted">
+        {{ tradeStats.buys }} شراء · {{ tradeStats.sells }} بيع
+        <template v-if="Math.abs(tradeStats.realized) >= 0.01">
+          · PnL {{ tradeStats.realized >= 0 ? "+" : "" }}{{ tradeStats.realized.toFixed(2) }}
+        </template>
+      </span>
     </div>
     <p v-if="klinesError" class="klines-err" role="status">{{ klinesError }}</p>
-    <div class="chart-stage">
+    <div
+      v-if="store.credentialsConfigured"
+      class="chart-live-bar"
+      :class="[
+        `env-${liveStrip.env}`,
+        `mode-${liveStrip.mode}`,
+        { stale: liveStrip.feedStale, mainnet: liveStrip.isMainnet },
+      ]"
+      role="status"
+      aria-live="polite"
+    >
+      <span class="live-bar-env">{{ liveStrip.envLabel }}</span>
+      <span class="live-bar-host muted">{{ liveStrip.host }}</span>
+      <span class="live-bar-sep" aria-hidden="true">·</span>
+      <span class="live-bar-feed" :class="{ ok: !liveStrip.feedStale && liveStrip.wsOk }">
+        {{
+          liveStrip.feedStale
+            ? "بث متأخر"
+            : liveStrip.wsOk
+              ? `بث حي${liveStrip.feedSec != null ? ` · ${liveStrip.feedSec}ث` : ""}`
+              : "WS غير متصل"
+        }}
+      </span>
+      <span class="live-bar-sep" aria-hidden="true">·</span>
+      <span class="live-bar-bal" :class="{ ok: liveStrip.balanceLive }">
+        {{ liveStrip.balanceLive ? "رصيد متزامن" : "رصيد…" }}
+      </span>
+      <template v-if="liveStrip.mode === 'live'">
+        <span class="live-bar-sep" aria-hidden="true">·</span>
+        <span class="live-bar-grid pulse">شبكة نشطة</span>
+        <span v-if="liveStrip.sessionDur" class="live-bar-session muted">
+          جلسة {{ liveStrip.sessionDur }}
+        </span>
+        <span v-if="liveStrip.alloc > 0" class="live-bar-alloc muted">
+          · {{ liveStrip.alloc.toFixed(0) }} USDT
+        </span>
+        <span
+          v-if="Math.abs(liveStrip.sessionPnl) >= 0.01"
+          class="live-bar-pnl"
+          :class="liveStrip.sessionPnl >= 0 ? 'up' : 'down'"
+        >
+          · جلسة {{ liveStrip.sessionPnl >= 0 ? "+" : "" }}{{ liveStrip.sessionPnl.toFixed(2) }}
+        </span>
+        <span v-if="liveStrip.orders > 0" class="live-bar-orders muted">
+          · {{ liveStrip.orders }} أمر معلّق
+        </span>
+      </template>
+      <template v-else-if="liveStrip.mode === 'other'">
+        <span class="live-bar-sep" aria-hidden="true">·</span>
+        <span class="live-bar-grid muted">
+          شبكة على {{ liveStrip.otherGrids }} زوج آخر — المعاينة: {{ liveStrip.sym }}
+        </span>
+      </template>
+      <template v-else-if="liveStrip.mode === 'orders'">
+        <span class="live-bar-sep" aria-hidden="true">·</span>
+        <span class="live-bar-grid muted">{{ liveStrip.orders }} أمر معلّق على {{ liveStrip.sym }}</span>
+      </template>
+      <template v-else>
+        <span class="live-bar-sep" aria-hidden="true">·</span>
+        <span class="live-bar-idle muted">جاهز — لا شبكة على هذا الزوج</span>
+      </template>
+      <span v-if="liveStrip.isMainnet" class="live-bar-warn">تداول حقيقي</span>
+    </div>
+    <div
+      class="chart-stage"
+      :class="[
+        `env-${liveStrip.env}`,
+        {
+          'session-live': liveStrip.mode === 'live' && showLiveLayer,
+          stale: liveStrip.feedStale,
+        },
+      ]"
+    >
       <div v-if="isLoading" class="chart-loading" aria-live="polite">جاري تحميل الشموع…</div>
+      <div
+        v-show="crosshairTip.visible"
+        class="crosshair-tip"
+        :style="{ left: `${crosshairTip.x}px`, top: `${crosshairTip.y}px` }"
+      >
+        {{ crosshairTip.text }}
+      </div>
       <div ref="root" class="chart-root" />
     </div>
   </div>
@@ -703,8 +1168,37 @@ onBeforeUnmount(() => {
 .legend-item.sell {
   color: #f6465d;
 }
-.chart-hint {
+.legend-item.mark {
+  color: #38bdf8;
+}
+.legend-item.mark.out {
+  color: #f59e0b;
+}
+.layer-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
   font-size: 0.72rem;
+  color: #94a3b8;
+  cursor: pointer;
+  user-select: none;
+}
+.chart-stats {
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+}
+.crosshair-tip {
+  position: absolute;
+  z-index: 4;
+  pointer-events: none;
+  padding: 0.25rem 0.45rem;
+  border-radius: 4px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: #e2e8f0;
+  background: rgba(15, 19, 24, 0.92);
+  border: 1px solid #334155;
+  white-space: nowrap;
 }
 .chart-stage {
   position: relative;
@@ -714,6 +1208,8 @@ onBeforeUnmount(() => {
   overscroll-behavior: contain;
 }
 .chart-root {
+  position: relative;
+  z-index: 1;
   width: 100%;
   min-width: 200px;
   min-height: 400px;
@@ -736,5 +1232,109 @@ onBeforeUnmount(() => {
   margin: 0 0 0.5rem;
   font-size: 0.8rem;
   color: #fbbf24;
+}
+.chart-live-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem 0.5rem;
+  margin-bottom: 0.45rem;
+  padding: 0.4rem 0.65rem;
+  border-radius: 8px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  border: 1px solid rgba(30, 38, 48, 0.9);
+  background: linear-gradient(180deg, rgba(15, 19, 24, 0.95), rgba(11, 14, 17, 0.88));
+}
+.chart-live-bar.env-demo {
+  border-color: rgba(56, 189, 248, 0.35);
+}
+.chart-live-bar.env-testnet {
+  border-color: rgba(245, 158, 11, 0.4);
+}
+.chart-live-bar.env-mainnet {
+  border-color: rgba(14, 203, 129, 0.35);
+}
+.chart-live-bar.mainnet {
+  box-shadow: inset 0 0 0 1px rgba(239, 68, 68, 0.15);
+}
+.chart-live-bar.stale {
+  border-color: rgba(251, 191, 36, 0.55);
+}
+.chart-live-bar.mode-live .live-bar-env {
+  color: #0ecb81;
+}
+.live-bar-host {
+  font-weight: 500;
+  font-size: 0.68rem;
+}
+.live-bar-sep {
+  opacity: 0.45;
+}
+.live-bar-feed.ok,
+.live-bar-bal.ok {
+  color: #34d399;
+}
+.live-bar-grid.pulse {
+  color: #0ecb81;
+  animation: live-bar-pulse 1.6s ease-in-out infinite;
+}
+@keyframes live-bar-pulse {
+  50% {
+    opacity: 0.55;
+  }
+}
+.live-bar-pnl.up {
+  color: #0ecb81;
+}
+.live-bar-pnl.down {
+  color: #f6465d;
+}
+.live-bar-warn {
+  margin-inline-start: auto;
+  padding: 0.12rem 0.45rem;
+  border-radius: 4px;
+  font-size: 0.65rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #fecaca;
+  background: rgba(239, 68, 68, 0.22);
+  border: 1px solid rgba(239, 68, 68, 0.45);
+}
+.chart-stage.env-demo.session-live {
+  box-shadow: inset 0 0 0 1px rgba(56, 189, 248, 0.12);
+}
+.chart-stage.env-testnet.session-live {
+  box-shadow: inset 0 0 0 1px rgba(245, 158, 11, 0.12);
+}
+.chart-stage.env-mainnet.session-live {
+  box-shadow: inset 0 0 0 1px rgba(239, 68, 68, 0.1);
+}
+.chart-stage.session-live::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  border-radius: 6px;
+  background: linear-gradient(
+    90deg,
+    rgba(14, 203, 129, 0.04) 0%,
+    transparent 18%,
+    transparent 82%,
+    rgba(14, 203, 129, 0.04) 100%
+  );
+}
+.chart-stage.stale::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  z-index: 3;
+  pointer-events: none;
+  background: linear-gradient(90deg, transparent, #f59e0b, transparent);
 }
 </style>

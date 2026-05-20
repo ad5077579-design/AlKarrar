@@ -39,6 +39,27 @@ export type MarketSymbol = {
   quoteVolume: number
 }
 
+export type SymbolSuggestion = {
+  rank: number
+  symbol: string
+  baseAsset: string
+  score: number
+  lastPrice: number
+  quoteVolume24h: number
+  priceChangePercent: number
+  dailyRangePct: number
+  generatorUpper: number
+  generatorLower: number
+  generatorCount: number
+  maxGeneratorCount: number
+  usdtPerLine: number
+  lineSpacingPct: number
+  minNotional: number
+  bandSpanPct: number
+  reasons: string[]
+  checks: Record<string, boolean>
+}
+
 export type TradeRow = {
   id?: number
   exchangeTradeId: string
@@ -86,6 +107,8 @@ export type GridLineTrailRow = {
   exchangeFillConfirmed?: boolean
   hasSessionBuy?: boolean
 }
+
+export type DashboardTabId = "watch" | "operate" | "logs"
 
 export type GridSymbolMeta = {
   ordersPlaced?: number
@@ -296,6 +319,12 @@ export const useBotStore = defineStore("bot", () => {
   const marketsExchangeTestnet = ref(false)
   const excludedStableSymbols = ref<string[]>([])
 
+  const symbolSuggestions = ref<SymbolSuggestion[]>([])
+  const suggestionsLoading = ref(false)
+  const suggestionsError = ref<string | null>(null)
+  const suggestionsUpdatedAt = ref("")
+  const suggestionsRejectedCount = ref(0)
+
   const trades = ref<TradeRow[]>([])
   const tradesSummary = ref<TradesSummary>({
     count: 0,
@@ -324,6 +353,7 @@ export const useBotStore = defineStore("bot", () => {
   const tradesBySymbol = ref<Record<string, SymbolTradesPack>>({})
   /** عند النقر على «سجل الصفقات» من كرت شبكة */
   const tradesViewSymbol = ref<string | null>(null)
+  const dashboardTab = ref<DashboardTabId>("watch")
   const gridLedgerBySymbol = ref<Record<string, GridLedgerPack>>({})
 
   /** live = آخر مزامنة ناجحة من Binance؛ pending = مفاتيح موجودة لكن لم تُجلب الأرصدة بعد؛ error = فشل المزامنة */
@@ -837,6 +867,9 @@ export const useBotStore = defineStore("bot", () => {
   async function bootstrapDashboard() {
     try {
       await fetchDashboard()
+      if (credentialsConfigured.value) {
+        void fetchSymbolSuggestions({ quiet: true })
+      }
     } catch {
       /* WS may still stream hub state after API comes up */
     }
@@ -970,11 +1003,97 @@ export const useBotStore = defineStore("bot", () => {
       excludedStableSymbols.value = Array.isArray(data.excludedStableSymbols)
         ? data.excludedStableSymbols.map((s) => String(s).toUpperCase())
         : []
+      if (credentialsConfigured.value) {
+        void fetchSymbolSuggestions({ quiet: true })
+      }
     } catch (e) {
       marketsError.value = String(e)
     } finally {
       marketsLoading.value = false
     }
+  }
+
+  function formatSuggestionsFetchError(e: unknown): string {
+    const err = e as { statusCode?: number; status?: number; data?: { detail?: unknown } }
+    const code = err?.statusCode ?? err?.status
+    if (code === 404) {
+      return (
+        "مسار العملات المقترحة غير موجود على الخادم — أعد تشغيل API: .\\restart_all.ps1 " +
+        "(يجب uvicorn --reload أو إعادة تشغيل كاملة)"
+      )
+    }
+    const detail = err?.data?.detail
+    if (typeof detail === "string" && detail.trim()) return detail
+    return String(e)
+  }
+
+  async function fetchSymbolSuggestions(opts?: { quiet?: boolean }) {
+    if (!credentialsConfigured.value) {
+      symbolSuggestions.value = []
+      return
+    }
+    const cfg = useRuntimeConfig()
+    const botId = String(cfg.public.botId)
+    if (!opts?.quiet) {
+      suggestionsLoading.value = true
+      suggestionsError.value = null
+    }
+    try {
+      const alloc = allocatedCapital.value > 0 ? allocatedCapital.value : initialCapital.value
+      const data = await apiFetch<{
+        updatedAt?: string
+        rejectedCount?: number
+        suggestions?: SymbolSuggestion[]
+      }>(`${publicApiPrefix()}/api/bots/${botId}/markets/suggestions`, {
+        query: {
+          quote: marketsQuote.value,
+          allocatedCapital: alloc,
+          limit: 10,
+        },
+      })
+      suggestionsUpdatedAt.value = data.updatedAt || ""
+      suggestionsRejectedCount.value = num(data.rejectedCount)
+      symbolSuggestions.value = (data.suggestions ?? []).map((row) => ({
+        rank: num(row.rank, 0),
+        symbol: String(row.symbol).toUpperCase(),
+        baseAsset: String(row.baseAsset),
+        score: num(row.score),
+        lastPrice: num(row.lastPrice),
+        quoteVolume24h: num(row.quoteVolume24h),
+        priceChangePercent: num(row.priceChangePercent),
+        dailyRangePct: num(row.dailyRangePct),
+        generatorUpper: num(row.generatorUpper),
+        generatorLower: num(row.generatorLower),
+        generatorCount: Math.max(2, Math.floor(num(row.generatorCount, 8))),
+        maxGeneratorCount: num(row.maxGeneratorCount),
+        usdtPerLine: num(row.usdtPerLine),
+        lineSpacingPct: num(row.lineSpacingPct),
+        minNotional: num(row.minNotional, 5),
+        bandSpanPct: num(row.bandSpanPct, 7),
+        reasons: Array.isArray(row.reasons) ? row.reasons.map((r) => String(r)) : [],
+        checks:
+          row.checks && typeof row.checks === "object"
+            ? (row.checks as Record<string, boolean>)
+            : {},
+      }))
+    } catch (e) {
+      const err = e as { statusCode?: number; status?: number }
+      const code = err?.statusCode ?? err?.status
+      if (!opts?.quiet || code === 404) {
+        suggestionsError.value = formatSuggestionsFetchError(e)
+      }
+    } finally {
+      if (!opts?.quiet) suggestionsLoading.value = false
+    }
+  }
+
+  async function applySymbolSuggestion(row: SymbolSuggestion) {
+    await selectSymbol(row.symbol)
+    await saveGridBand({
+      generatorUpper: row.generatorUpper,
+      generatorLower: row.generatorLower,
+      generatorCount: row.generatorCount,
+    })
   }
 
   async function selectSymbol(sym: string) {
@@ -1152,10 +1271,21 @@ export const useBotStore = defineStore("bot", () => {
     )
   }
 
+  function setDashboardTab(tab: DashboardTabId) {
+    dashboardTab.value = tab
+  }
+
   function openTradesForSymbol(sym: string) {
     const normalized = sym.trim().toUpperCase().replace("/", "")
+    if (!normalized) return
     tradesViewSymbol.value = normalized
-    void fetchTradesForSymbol(normalized)
+    dashboardTab.value = "logs"
+    // Align chart, mark, and grid band with the journal symbol (was: journal ENJ + chart EDEN).
+    if (normalized !== symbol.value.trim().toUpperCase().replace("/", "")) {
+      void selectSymbol(normalized)
+    } else {
+      void fetchTradesForSymbol(normalized)
+    }
   }
 
   async function fetchTrades(opts?: { quiet?: boolean }) {
@@ -1433,6 +1563,11 @@ export const useBotStore = defineStore("bot", () => {
     marketsUpdatedAt,
     marketsExchangeTestnet,
     excludedStableSymbols,
+    symbolSuggestions,
+    suggestionsLoading,
+    suggestionsError,
+    suggestionsUpdatedAt,
+    suggestionsRejectedCount,
     trades,
     tradesSummary,
     tradesLoading,
@@ -1451,6 +1586,8 @@ export const useBotStore = defineStore("bot", () => {
     gridsBySymbol,
     tradesBySymbol,
     tradesViewSymbol,
+    dashboardTab,
+    setDashboardTab,
     gridLedgerBySymbol,
     gridLedgerPack,
     fetchGridLedger,
@@ -1472,6 +1609,8 @@ export const useBotStore = defineStore("bot", () => {
     saveGridBand,
     setAutoCompounding,
     fetchMarkets,
+    fetchSymbolSuggestions,
+    applySymbolSuggestion,
     selectSymbol,
     fetchTrades,
     fetchGridStatus,

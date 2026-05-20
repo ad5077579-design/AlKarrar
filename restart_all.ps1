@@ -1,7 +1,8 @@
-# AlKarrar Pro — تشغيل موحّد: إيقاف ما يغلق المنافذ 8090 / 3000 ثم تشغيل API + الواجهة.
-# الاستخدام: انقر يميناً → Run with PowerShell، أو من جذر المشروع:  .\restart_all.ps1
-# خيارات:
-#   .\restart_all.ps1 -NoApiReload     إيقاف --reload لـ uvicorn (اتصال WS أثقل استقراراً عند تعديلات نادرة)
+# AlKarrar Pro — تشغيل موحّد (أمر واحد = خلفية + واجهة)
+#   .\start.ps1          ← الأبسط (نفس هذا الملف)
+#   .\restart_all.ps1
+# لا حاجة لتشغيل scripts\run_api.ps1 و scripts\run_frontend.ps1 يدوياً.
+# خيار: .\start.ps1 -NoApiReload
 
 param(
     [switch]$NoApiReload
@@ -66,8 +67,15 @@ Start-Process -FilePath $shell -WorkingDirectory $root -ArgumentList @(
     "-File", $feScript
 ) -WindowStyle Normal
 
-Write-Host "AlKarrar Pro: freed ports 8090 & 3000; API (uvicorn$(if (-not $NoApiReload) { ' +reload' })) + Nuxt dev starting in new windows."
-Write-Host "  API:      http://127.0.0.1:8090   |  UI: http://localhost:3000"
+Write-Host ""
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host "  AlKarrar Pro — تشغيل واحد (امرين داخلياً فقط)" -ForegroundColor Cyan
+Write-Host "  لا تغلق هاتين النافذتين:" -ForegroundColor Cyan
+Write-Host "    [1] API خلفية  -> http://127.0.0.1:8090" -ForegroundColor Green
+Write-Host "    [2] الواجهة     -> http://localhost:3000" -ForegroundColor Green
+Write-Host "  ايقاف: .\stop.ps1" -ForegroundColor Yellow
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host ""
 Write-Host "Waiting for Nuxt (first start may take ~60s)..."
 Start-Sleep -Seconds 12
 Start-Process "http://localhost:3000"

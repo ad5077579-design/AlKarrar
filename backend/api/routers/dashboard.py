@@ -167,6 +167,97 @@ def _merge_advanced_grid_settings(
         settings["max_slippage_pct"] = max(0.0, float(slip))
 
 
+@router.get("/{bot_id}/markets/suggestions")
+async def get_market_suggestions(
+    bot_id: str,
+    quote: str = Query("USDT", min_length=3, max_length=12),
+    allocated_capital: float | None = Query(None, alias="allocatedCapital", gt=0),
+    band_span_pct: float = Query(7.0, alias="bandSpanPct", ge=2.0, le=20.0),
+    limit: int = Query(12, ge=1, le=24),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """
+    Rank Spot USDT pairs for AlKarrar shifting grid (liquidity, volatility, line economics).
+    Only symbols passing ``validate_grid_economics`` with a calibrated band are returned.
+    """
+    from backend.api.grid_symbol_scanner import (
+        GridScanCriteria,
+        rank_grid_symbol_suggestions,
+        suggestions_payload,
+    )
+
+    try:
+        k1, k2, env, _legacy = await get_binance_keys(bot_id)
+    except Exception as exc:
+        _log.exception("suggestions: get_binance_keys failed")
+        raise HTTPException(
+            status_code=503,
+            detail=f"credentials lookup failed: {type(exc).__name__}: {exc}",
+        ) from exc
+
+    stream_env = env if (k1 and k2) else EngineSettings().resolved_binance_env()
+    quote_u = quote.strip().upper()
+
+    alloc = float(allocated_capital) if allocated_capital and allocated_capital > 0 else 0.0
+    if alloc <= 0:
+        row = await db.scalar(select(BotSettings).where(BotSettings.bot_id == bot_id))
+        cfg = dict(row.config_json or {}) if row else {}
+        alloc = float(
+            cfg.get("allocatedCapital")
+            or cfg.get("initialCapital")
+            or hub.state.get("allocatedCapital")
+            or hub.state.get("initialCapital")
+            or 100.0
+        )
+    if alloc <= 0:
+        alloc = 100.0
+
+    client: BinanceSpotClient | None = None
+    try:
+        client = await BinanceSpotClient.create_for_env(
+            api_key=k1,
+            api_secret=k2,
+            env=stream_env,
+        )
+        info = await client.get_exchange_info()
+        tickers = await client.get_tickers_24hr()
+    except BinanceAPIException as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Binance API {getattr(exc, 'code', '')}: {getattr(exc, 'message', str(exc))}",
+        ) from exc
+    except BinanceRequestException as exc:
+        raise HTTPException(status_code=502, detail=f"Binance request failed: {exc}") from exc
+    finally:
+        if client is not None:
+            await client.aclose()
+
+    raw_symbols = info.get("symbols") if isinstance(info, dict) else []
+    sym_rows = [r for r in raw_symbols if isinstance(r, dict)] if isinstance(raw_symbols, list) else []
+    criteria = GridScanCriteria(band_span_pct=float(band_span_pct))
+    active = frozenset(s.strip().upper() for s in grid_manager.active_symbols())
+    results, rejected = rank_grid_symbol_suggestions(
+        exchange_symbols=sym_rows,
+        tickers=tickers if isinstance(tickers, list) else [],
+        allocated_capital=alloc,
+        quote=quote_u,
+        limit=limit,
+        criteria=criteria,
+        exclude_symbols=active,
+    )
+    payload = suggestions_payload(
+        results,
+        allocated_capital=alloc,
+        binance_env=stream_env,
+        rejected_count=rejected,
+        criteria=criteria,
+    )
+    payload["quote"] = quote_u
+    payload["exchangeTestnet"] = exchange_testnet_flag(stream_env)
+    payload["bot_id"] = bot_id
+    return payload
+
+
 @router.get("/{bot_id}/markets")
 async def get_markets(
     bot_id: str,
@@ -364,6 +455,27 @@ async def _persist_bot_config(db: AsyncSession, bot_id: str, patch: dict[str, An
     row.config_json = cfg
     row.updated_at = datetime.now(timezone.utc)
     await db.commit()
+
+
+@router.get("/{bot_id}/grid/limits")
+async def grid_line_limits(
+    bot_id: str,
+    generator_upper: float = Query(..., alias="generatorUpper"),
+    generator_lower: float = Query(..., alias="generatorLower"),
+    allocated_capital: float = Query(..., alias="allocatedCapital"),
+    generator_count: int | None = Query(None, alias="generatorCount"),
+) -> dict[str, Any]:
+    """Max allowed grid lines for a band + allocation (same rules as grid start validation)."""
+    from backend.api.spot_realized_ledger import compute_grid_line_limits
+
+    limits = compute_grid_line_limits(
+        generator_upper=generator_upper,
+        generator_lower=generator_lower,
+        allocated_capital=allocated_capital,
+        generator_count=generator_count,
+    )
+    limits["bot_id"] = bot_id
+    return limits
 
 
 @router.get("/{bot_id}/grid/status")
@@ -669,7 +781,8 @@ async def get_klines(
             continue
         o_time = int(row[0]) // 1000
         o, h, low, c = float(row[1]), float(row[2]), float(row[3]), float(row[4])
-        out.append({"time": o_time, "open": o, "high": h, "low": low, "close": c})
+        vol = float(row[5]) if len(row) > 5 else 0.0
+        out.append({"time": o_time, "open": o, "high": h, "low": low, "close": c, "volume": vol})
     return out
 
 
@@ -695,6 +808,38 @@ async def patch_settings(
     cfg = dict(row.config_json or {})
     cfg.update(patch)
     state_patch = dict(patch)
+    if any(
+        k in patch
+        for k in (
+            "generatorUpper",
+            "generatorLower",
+            "generatorCount",
+            "allocatedCapital",
+            "initialCapital",
+        )
+    ):
+        from backend.api.spot_realized_ledger import compute_grid_line_limits
+
+        merged_preview = {**cfg, **patch}
+        alloc = float(
+            merged_preview.get("allocatedCapital")
+            or merged_preview.get("initialCapital")
+            or 0
+        )
+        gcount = merged_preview.get("generatorCount")
+        limits = compute_grid_line_limits(
+            generator_upper=float(merged_preview.get("generatorUpper") or 0),
+            generator_lower=float(merged_preview.get("generatorLower") or 0),
+            allocated_capital=alloc,
+            generator_count=int(gcount) if gcount is not None else None,
+        )
+        if limits.get("valid"):
+            max_g = int(limits["maxGeneratorCount"])
+            cfg["maxGeneratorCount"] = max_g
+            state_patch["maxGeneratorCount"] = max_g
+            if gcount is not None and int(gcount) > max_g:
+                cfg["generatorCount"] = max_g
+                state_patch["generatorCount"] = max_g
     if patch.get("autoCompoundingEnabled") is True:
         cfg["profit_injection_mode"] = "compound_size"
         cfg["compoundingFactor"] = 1.0

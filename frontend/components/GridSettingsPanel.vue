@@ -1,5 +1,10 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from "vue"
+import {
+  bandFromMarkSpan,
+  computeGridLineLimits,
+  limitingFactorLabelAr,
+} from "~/utils/gridLineLimits"
 import { useBotStore } from "~/stores/bot"
 
 const store = useBotStore()
@@ -37,9 +42,41 @@ watch(
 
 const mark = computed(() => store.markPrice)
 const gridCount = computed(() => Math.max(2, Math.floor(form.generatorCount) || 2))
+
+const lineLimits = computed(() =>
+  computeGridLineLimits({
+    generatorUpper: form.generatorUpper,
+    generatorLower: form.generatorLower,
+    allocatedCapital: form.allocatedCapital,
+    generatorCount: gridCount.value,
+  }),
+)
+
+const maxAllowedLines = computed(() =>
+  lineLimits.value.valid ? lineLimits.value.maxGeneratorCount : 2,
+)
+
+const countOverMax = computed(
+  () => lineLimits.value.valid && gridCount.value > maxAllowedLines.value,
+)
+
 const rangeValid = computed(
   () => form.generatorUpper > form.generatorLower && form.generatorLower > 0,
 )
+
+watch(maxAllowedLines, (maxN) => {
+  if (lineLimits.value.valid && form.generatorCount > maxN) {
+    form.generatorCount = maxN
+  }
+})
+
+function applyBandFromMark(spanPct = 3.5) {
+  const mk = mark.value
+  if (!(mk > 0)) return
+  const { lower, upper } = bandFromMarkSpan(mk, spanPct)
+  form.generatorLower = lower
+  form.generatorUpper = upper
+}
 
 const gridStep = computed(() => {
   if (!rangeValid.value) return 0
@@ -111,12 +148,16 @@ function formatPrice(n: number): string {
 }
 
 async function onSave() {
+  if (countOverMax.value) {
+    alert(`عدد الخطوط يتجاوز الحد الأقصى (${maxAllowedLines.value})`)
+    return
+  }
   saving.value = true
   try {
     await store.saveGridBand({
       generatorUpper: form.generatorUpper,
       generatorLower: form.generatorLower,
-      generatorCount: form.generatorCount,
+      generatorCount: Math.min(gridCount.value, maxAllowedLines.value),
     })
   } finally {
     saving.value = false
@@ -134,6 +175,12 @@ async function onStartGrid() {
   }
   if (!rangeValid.value) {
     alert("عيّن نطاقاً صالحاً: generatorLower < generatorUpper")
+    return
+  }
+  if (countOverMax.value || !lineLimits.value.economicsOk) {
+    alert(
+      `عدد الخطوط غير مسموح: الحد الأقصى ${maxAllowedLines.value} — ${limitingFactorLabelAr(lineLimits.value.limitingFactor)}`,
+    )
     return
   }
   if (!store.autoCompoundingEnabled) {
@@ -258,9 +305,39 @@ onMounted(() => {
         <div class="form-block">
           <h3 class="block-title">نطاق الشبكة</h3>
           <p class="block-hint muted">الحقول العقدية فقط — مرتبطة مباشرة بالخادم</p>
+          <div v-if="mark > 0" class="mark-band-row">
+            <span class="mark-band-label muted">Mark {{ formatPrice(mark) }}</span>
+            <button type="button" class="btn-band" @click="applyBandFromMark(3.5)">
+              نطاق ±3.5% حول Mark
+            </button>
+            <button type="button" class="btn-band subtle" @click="applyBandFromMark(7)">
+              ±7%
+            </button>
+          </div>
+          <div v-if="rangeValid && lineLimits.valid" class="lines-limit-card">
+            <div class="lines-limit-head">
+              <span class="lines-max-badge">الحد الأقصى: {{ maxAllowedLines }} خط</span>
+              <span class="lines-limit-reason muted">
+                يحدّه: {{ limitingFactorLabelAr(lineLimits.limitingFactor) }}
+              </span>
+            </div>
+            <p class="lines-limit-detail muted">
+              عرض النطاق {{ lineLimits.bandSpanPct.toFixed(2) }}% · مسافة الخط
+              {{ lineLimits.lineSpacingPct.toFixed(3) }}% (أدنى
+              {{ lineLimits.minLineSpacingPct }}%) · USDT/خط
+              {{ lineLimits.usdtPerLine.toFixed(2) }}
+            </p>
+            <p v-if="countOverMax || !lineLimits.economicsOk" class="lines-limit-warn" role="alert">
+              {{
+                countOverMax
+                  ? `عدد الخطوط (${gridCount}) يتجاوز الحد — اختر حتى ${maxAllowedLines} خطوط`
+                  : "الإعداد الحالي لا يجتاز حدود المسافة أو USDT لكل خط"
+              }}
+            </p>
+          </div>
           <div class="field-row">
             <label class="field-label" for="grid-upper">
-              <span>generatorUpper</span>
+              <span>generatorUpper (قمة)</span>
             </label>
             <div class="field-input-wrap">
               <input
@@ -276,7 +353,7 @@ onMounted(() => {
           </div>
           <div class="field-row">
             <label class="field-label" for="grid-lower">
-              <span>generatorLower</span>
+              <span>generatorLower (قاع)</span>
             </label>
             <div class="field-input-wrap">
               <input
@@ -299,9 +376,10 @@ onMounted(() => {
                 id="grid-count"
                 v-model.number="form.generatorCount"
                 class="bn-input"
+                :class="{ 'input-over-max': countOverMax }"
                 type="number"
                 min="2"
-                max="200"
+                :max="maxAllowedLines"
                 required
               />
               <input
@@ -309,14 +387,19 @@ onMounted(() => {
                 class="count-slider"
                 type="range"
                 min="2"
-                max="50"
+                :max="maxAllowedLines"
               />
+              <span class="count-cap muted">2 – {{ maxAllowedLines }} خط مسموح</span>
             </div>
           </div>
         </div>
 
         <div class="action-row">
-          <button class="btn-save" type="submit" :disabled="saving || !rangeValid">
+          <button
+            class="btn-save"
+            type="submit"
+            :disabled="saving || !rangeValid || countOverMax"
+          >
             {{ saving ? "جاري الحفظ…" : "حفظ النطاق" }}
           </button>
           <button
@@ -327,7 +410,9 @@ onMounted(() => {
               gridStarting ||
               !store.credentialsConfigured ||
               !store.autoCompoundingEnabled ||
-              !allocationValid
+              !allocationValid ||
+              countOverMax ||
+              !lineLimits.economicsOk
             "
             @click="onStartGrid"
           >
@@ -390,8 +475,8 @@ onMounted(() => {
             <dd>{{ usdtPerLine > 0 ? `${usdtPerLine.toFixed(2)}` : "—" }}</dd>
           </div>
           <div class="stat">
-            <dt>generatorCount</dt>
-            <dd>{{ store.generatorCount }}</dd>
+            <dt>الخطوط (حالي / أقصى)</dt>
+            <dd>{{ gridCount }} / {{ rangeValid ? maxAllowedLines : "—" }}</dd>
           </div>
         </dl>
         <button type="button" class="levels-toggle" @click="showLevels = !showLevels">
@@ -725,5 +810,69 @@ onMounted(() => {
 }
 .muted {
   color: #848e9c;
+}
+.mark-band-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  margin-bottom: 0.65rem;
+}
+.mark-band-label {
+  font-size: 0.72rem;
+  margin-inline-end: 0.25rem;
+}
+.btn-band {
+  border: 1px solid rgba(240, 185, 11, 0.45);
+  background: rgba(240, 185, 11, 0.08);
+  color: #f0b90b;
+  border-radius: 4px;
+  padding: 0.28rem 0.55rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+.btn-band.subtle {
+  border-color: #474d57;
+  background: transparent;
+  color: #848e9c;
+}
+.lines-limit-card {
+  margin-bottom: 0.75rem;
+  padding: 0.55rem 0.65rem;
+  border-radius: 6px;
+  border: 1px solid rgba(240, 185, 11, 0.25);
+  background: rgba(240, 185, 11, 0.06);
+}
+.lines-limit-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.35rem 0.65rem;
+  margin-bottom: 0.25rem;
+}
+.lines-max-badge {
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: #f0b90b;
+}
+.lines-limit-reason {
+  font-size: 0.68rem;
+}
+.lines-limit-detail {
+  margin: 0;
+  font-size: 0.68rem;
+  line-height: 1.4;
+}
+.lines-limit-warn {
+  margin: 0.35rem 0 0;
+  font-size: 0.72rem;
+  color: #f6465d;
+}
+.input-over-max {
+  border-color: #f6465d !important;
+}
+.count-cap {
+  font-size: 0.68rem;
 }
 </style>
