@@ -76,11 +76,11 @@ function baseAsset(s: string): string {
   justify-content: space-between;
   gap: 0.75rem;
   flex-wrap: wrap;
-  padding: 0.55rem 0.75rem;
-  margin-bottom: 0.65rem;
-  border-radius: 10px;
-  background: rgba(56, 189, 248, 0.06);
-  border: 1px solid rgba(56, 189, 248, 0.22);
+  padding: 0.65rem 0.9rem;
+  margin-bottom: 0.15rem;
+  border-radius: var(--radius-md);
+  background: linear-gradient(90deg, var(--info-dim), rgba(56, 189, 248, 0.02));
+  border: 1px solid var(--info-border);
 }
 .ctx-main {
   display: flex;

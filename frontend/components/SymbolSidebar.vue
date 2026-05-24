@@ -1,6 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onBeforeUnmount, ref, watch } from "vue"
-import SuggestedSymbolsPanel from "~/components/SuggestedSymbolsPanel.vue"
+import { computed, onMounted, onBeforeUnmount, ref } from "vue"
 import { useBotStore, type MarketSymbol } from "~/stores/bot"
 
 const store = useBotStore()
@@ -53,20 +52,10 @@ async function onPick(row: MarketSymbol) {
 
 onMounted(() => {
   void store.fetchMarkets()
-  if (store.credentialsConfigured) {
-    void store.fetchSymbolSuggestions()
-  }
   refreshTimer = setInterval(() => {
     void store.fetchMarkets()
   }, 45_000)
 })
-
-watch(
-  () => store.credentialsConfigured,
-  (ok) => {
-    if (ok) void store.fetchSymbolSuggestions()
-  },
-)
 
 onBeforeUnmount(() => {
   if (refreshTimer) clearInterval(refreshTimer)
@@ -99,8 +88,6 @@ onBeforeUnmount(() => {
       placeholder="بحث (BTC, DOGE…)"
       autocomplete="off"
     />
-
-    <SuggestedSymbolsPanel />
 
     <p v-if="store.marketsError" class="markets-err" role="alert">{{ store.marketsError }}</p>
 
@@ -154,172 +141,211 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .symbol-sidebar {
-  width: 280px;
+  width: 292px;
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
-  gap: 0.5rem;
-  padding: 1rem 0.85rem;
-  background: linear-gradient(180deg, #0d1117 0%, #0b0e11 100%);
+  gap: 0.55rem;
+  padding: 1.1rem 0.95rem;
+  background: linear-gradient(180deg, rgba(12, 16, 23, 0.98) 0%, rgba(7, 10, 15, 1) 100%);
   border-inline-end: 1px solid var(--border);
   min-height: 100vh;
   box-sizing: border-box;
 }
+
 .sidebar-head {
   display: flex;
   align-items: center;
   gap: 0.45rem;
 }
+
 .sidebar-title {
   margin: 0;
-  font-size: 0.95rem;
-  font-weight: 700;
+  font-size: 0.92rem;
+  font-weight: 800;
+  letter-spacing: -0.02em;
   flex: 1;
 }
+
 .env-tag {
-  font-size: 0.62rem;
+  font-size: 0.6rem;
   font-weight: 700;
   text-transform: uppercase;
-  padding: 0.15rem 0.4rem;
-  border-radius: 4px;
+  padding: 0.18rem 0.42rem;
+  border-radius: var(--radius-pill);
   border: 1px solid transparent;
 }
+
 .env-tag.demo {
-  background: rgba(56, 189, 248, 0.14);
+  background: var(--info-dim);
   color: #7dd3fc;
-  border-color: rgba(56, 189, 248, 0.35);
+  border-color: var(--info-border);
 }
+
 .env-tag.testnet {
-  background: rgba(245, 158, 11, 0.15);
+  background: var(--warn-dim);
   color: #fbbf24;
   border-color: rgba(245, 158, 11, 0.35);
 }
+
 .env-tag.mainnet {
-  background: rgba(14, 203, 129, 0.12);
+  background: var(--accent-dim);
   color: #34d399;
-  border-color: rgba(14, 203, 129, 0.4);
+  border-color: var(--accent-border);
 }
+
 .refresh-btn {
   width: 2rem;
   height: 2rem;
-  border-radius: 6px;
-  border: 1px solid var(--border);
-  background: #151a22;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong);
+  background: rgba(15, 19, 24, 0.8);
   color: var(--muted);
   cursor: pointer;
   font-size: 1rem;
   line-height: 1;
+  transition:
+    color var(--transition),
+    border-color var(--transition),
+    background var(--transition);
 }
+
 .refresh-btn:hover:not(:disabled) {
-  color: var(--text);
-  border-color: rgba(56, 189, 248, 0.4);
+  color: var(--info);
+  border-color: var(--info-border);
+  background: var(--info-dim);
 }
+
 .refresh-btn:disabled {
-  opacity: 0.5;
+  opacity: 0.45;
 }
+
 .sidebar-hint {
   margin: 0;
-  font-size: 0.72rem;
+  font-size: 0.7rem;
 }
+
 .search {
-  margin-top: 0.15rem;
+  margin-top: 0.1rem;
 }
+
 .markets-err {
   margin: 0;
   font-size: 0.75rem;
   color: #fbbf24;
 }
+
 .sidebar-loading,
 .empty,
 .updated {
   margin: 0;
-  font-size: 0.78rem;
+  font-size: 0.76rem;
 }
+
 .symbol-list {
   list-style: none;
   margin: 0;
-  padding: 0;
+  padding: 0.15rem 0 0;
   overflow-y: auto;
   flex: 1;
   min-height: 120px;
-  max-height: calc(100vh - 22rem);
-  scrollbar-width: thin;
-  scrollbar-color: #2a3340 transparent;
+  max-height: calc(100vh - 21rem);
 }
+
 .symbol-list li {
-  margin: 0 0 0.2rem;
+  margin: 0 0 0.22rem;
 }
+
 .symbol-row {
   width: 100%;
   display: grid;
   grid-template-columns: 1fr auto;
   grid-template-rows: auto auto;
-  gap: 0.1rem 0.5rem;
+  gap: 0.08rem 0.55rem;
   align-items: center;
   text-align: start;
-  padding: 0.5rem 0.55rem;
-  border-radius: 8px;
+  padding: 0.55rem 0.6rem;
+  border-radius: var(--radius-sm);
   border: 1px solid transparent;
   background: transparent;
   color: var(--text);
   cursor: pointer;
   font: inherit;
+  transition:
+    background var(--transition),
+    border-color var(--transition);
 }
+
 .symbol-row:hover:not(:disabled) {
-  background: rgba(30, 38, 48, 0.65);
-  border-color: rgba(30, 38, 48, 0.9);
+  background: rgba(24, 32, 48, 0.75);
+  border-color: var(--border);
 }
+
 .symbol-row.active {
-  background: rgba(56, 189, 248, 0.1);
-  border-color: rgba(56, 189, 248, 0.45);
+  background: var(--info-dim);
+  border-color: var(--info-border);
+  box-shadow: inset 0 0 0 1px rgba(56, 189, 248, 0.08);
 }
+
 .symbol-row.pending {
-  opacity: 0.65;
+  opacity: 0.6;
 }
+
 .symbol-row:disabled {
   cursor: wait;
 }
+
 .sym-main {
   grid-row: 1 / 3;
   display: flex;
   flex-direction: column;
   align-items: flex-start;
 }
+
 .sym-base {
   font-weight: 700;
-  font-size: 0.88rem;
-  letter-spacing: 0.02em;
+  font-size: 0.86rem;
+  letter-spacing: 0.01em;
 }
+
 .sym-quote {
-  font-size: 0.68rem;
+  font-size: 0.66rem;
   color: var(--muted);
 }
+
 .sym-stats {
   display: flex;
   flex-direction: column;
   align-items: flex-end;
-  gap: 0.05rem;
+  gap: 0.04rem;
 }
+
 .sym-price {
-  font-size: 0.78rem;
-  font-variant-numeric: tabular-nums;
-}
-.sym-pct {
-  font-size: 0.72rem;
+  font-size: 0.76rem;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
 }
+
+.sym-pct {
+  font-size: 0.7rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
 .sym-pct.up {
   color: var(--accent);
 }
+
 .sym-pct.down {
   color: var(--danger);
 }
+
 .sym-vol {
   grid-column: 2;
-  font-size: 0.65rem;
+  font-size: 0.62rem;
   text-align: end;
 }
+
 @media (max-width: 960px) {
   .symbol-sidebar {
     width: 100%;

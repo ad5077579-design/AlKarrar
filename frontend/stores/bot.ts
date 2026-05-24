@@ -850,10 +850,14 @@ export const useBotStore = defineStore("bot", () => {
   async function fetchDashboard() {
     const cfg = useRuntimeConfig()
     const botId = String(cfg.public.botId)
+    const sym = symbol.value.trim().toUpperCase().replace("/", "")
     try {
       const data = await apiFetch<Record<string, unknown>>(
         `${publicApiPrefix()}/api/bots/${botId}/dashboard`,
-        { timeout: 12_000 },
+        {
+          timeout: 12_000,
+          ...(sym ? { query: { symbol: sym } } : {}),
+        },
       )
       apiReachable.value = true
       applySnapshot(data)

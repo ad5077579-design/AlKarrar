@@ -64,19 +64,20 @@ async function onEmergency() {
   justify-content: space-between;
   gap: 1rem;
   flex-wrap: wrap;
-  padding: 0.65rem 1rem;
-  background: #181a20;
-  border: 1px solid #2b3139;
-  border-radius: 8px;
+  padding: 0.7rem 1rem;
+  background: linear-gradient(180deg, rgba(19, 26, 36, 0.95), rgba(15, 19, 24, 0.98));
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-sm);
 }
 .trailing-pill {
   display: flex;
   align-items: center;
   gap: 0.65rem;
-  padding: 0.45rem 0.75rem;
-  border-radius: 6px;
-  border: 1px solid #2b3139;
-  background: #1e2329;
+  padding: 0.5rem 0.8rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: rgba(7, 10, 15, 0.55);
   min-width: 0;
   flex: 1;
 }
@@ -125,17 +126,21 @@ async function onEmergency() {
 .btn-emergency {
   flex-shrink: 0;
   border: none;
-  border-radius: 6px;
-  padding: 0.65rem 1.35rem;
-  font-size: 0.9rem;
+  border-radius: var(--radius-sm);
+  padding: 0.68rem 1.4rem;
+  font-size: 0.86rem;
   font-weight: 700;
+  font-family: inherit;
   cursor: pointer;
   color: #fff;
-  background: #f6465d;
-  transition: background 0.15s ease, transform 0.1s ease;
+  background: linear-gradient(180deg, #ff5569 0%, var(--danger) 100%);
+  box-shadow: 0 2px 12px rgba(246, 70, 93, 0.28);
+  transition:
+    filter var(--transition),
+    transform 0.12s ease;
 }
 .btn-emergency:hover:not(:disabled) {
-  background: #ff707e;
+  filter: brightness(1.08);
 }
 .btn-emergency:active:not(:disabled) {
   transform: scale(0.98);

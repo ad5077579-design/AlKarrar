@@ -36,10 +36,10 @@ async function onHaltFlatten() {
 
 <template>
   <section class="bot-assign panel" aria-labelledby="bot-assign-heading">
-    <div class="bot-assign-head">
+    <header class="bot-assign-head panel-header">
       <div>
-        <h2 id="bot-assign-heading">شبكة نشطة — إدارة</h2>
-        <p class="bot-assign-desc muted">
+        <h2 id="bot-assign-heading" class="panel-title">شبكة نشطة — إدارة</h2>
+        <p class="panel-subtitle">
           على {{ store.spotEnvLabelAr }} ·
           {{ activeList.length === 1 ? activeList[0] : `${activeList.length} أزواج` }}
           · إيقاف كامل يلغي الأوامر ويبيع عملة الأساس بالسوق للزوج المختار في الشريط.
@@ -53,7 +53,7 @@ async function onHaltFlatten() {
       >
         {{ loading ? "جاري الإيقاف…" : "إيقاف وتصفية (إلغاء أوامر + بيع الأساس بالسوق)" }}
       </button>
-    </div>
+    </header>
 
     <ul class="assign-list">
       <li v-for="sym in activeList" :key="sym">
@@ -75,40 +75,26 @@ async function onHaltFlatten() {
 
 <style scoped>
 .bot-assign {
-  background: #1e2329;
-  border: 1px solid #2b3139;
-  border-radius: 8px;
-  padding: 0.95rem 1.1rem 1rem;
+  padding-top: 0.9rem;
 }
 .bot-assign-head {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  gap: 1rem;
-  flex-wrap: wrap;
   margin-bottom: 0.75rem;
 }
-.bot-assign-head h2 {
-  margin: 0 0 0.35rem;
-  font-size: 0.95rem;
-  font-weight: 600;
-}
-.bot-assign-desc {
-  margin: 0;
-  font-size: 0.76rem;
-  line-height: 1.45;
-  max-width: 560px;
-}
 .btn-halt-flatten {
-  border: 1px solid rgba(246, 70, 93, 0.55);
-  background: rgba(246, 70, 93, 0.18);
-  color: #ff9aa8;
-  font-size: 0.78rem;
+  border: 1px solid rgba(246, 70, 93, 0.45);
+  background: var(--danger-dim);
+  color: #fecdd3;
+  font-size: 0.76rem;
   font-weight: 700;
-  padding: 0.5rem 0.95rem;
-  border-radius: 6px;
+  font-family: inherit;
+  padding: 0.52rem 0.95rem;
+  border-radius: var(--radius-sm);
   cursor: pointer;
   white-space: nowrap;
+  transition: filter var(--transition);
+}
+.btn-halt-flatten:hover:not(:disabled) {
+  filter: brightness(1.08);
 }
 .btn-halt-flatten:disabled {
   opacity: 0.55;
@@ -120,7 +106,7 @@ async function onHaltFlatten() {
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 0.55rem;
+  gap: 0.5rem;
   font-size: 0.8rem;
 }
 .assign-list li {
@@ -128,27 +114,28 @@ async function onHaltFlatten() {
   align-items: center;
   flex-wrap: wrap;
   gap: 0.5rem 0.85rem;
-  padding: 0.45rem 0.55rem;
-  background: rgba(24, 26, 32, 0.85);
-  border-radius: 6px;
-  border: 1px solid rgba(43, 49, 57, 0.75);
+  padding: 0.5rem 0.65rem;
+  background: rgba(7, 10, 15, 0.55);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
 }
 .assign-list .lbl {
   flex: 0 0 auto;
   min-width: 8.5rem;
-  color: #848e9c;
+  color: var(--muted);
   font-weight: 600;
 }
 .assign-list .sym {
   font-weight: 700;
-  color: #f0b90b;
+  color: var(--warn);
   letter-spacing: 0.03em;
 }
 .assign-list .sym.live {
-  color: #34d399;
+  color: var(--accent);
 }
 .assign-list .hint {
   font-size: 0.72rem;
+  color: var(--muted);
 }
 @media (max-width: 560px) {
   .assign-list .lbl {

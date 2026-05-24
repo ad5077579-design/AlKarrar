@@ -92,3 +92,31 @@ export function markFeedAgeSec(lastWsAtMs: number, nowMs = Date.now()): number |
   if (!(lastWsAtMs > 0)) return null
   return Math.max(0, Math.floor((nowMs - lastWsAtMs) / 1000))
 }
+
+/** Fractional distance between band midpoint and live mark (matches backend). */
+export function bandMidDeviationPct(
+  generatorUpper: number,
+  generatorLower: number,
+  markPrice: number,
+): number {
+  const upper = Number(generatorUpper)
+  const lower = Number(generatorLower)
+  const mark = Number(markPrice)
+  if (!(mark > 0) || !(lower < upper)) return 0
+  const mid = (upper + lower) / 2
+  return Math.abs(mid - mark) / mark
+}
+
+/** True when the stored grid band belongs to the symbol's current mark. */
+export function bandMatchesMark(
+  generatorUpper: number,
+  generatorLower: number,
+  markPrice: number,
+  maxMidDeviationPct = 0.35,
+): boolean {
+  const hi = Number(generatorUpper)
+  const lo = Number(generatorLower)
+  const mark = Number(markPrice)
+  if (!(mark > 0) || !(lo < hi)) return false
+  return bandMidDeviationPct(hi, lo, mark) <= maxMidDeviationPct
+}

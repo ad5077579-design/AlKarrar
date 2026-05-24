@@ -217,24 +217,27 @@ async function onStop() {
 
 <style scoped>
 .grid-card {
-  background: #0f1318;
-  border: 1px solid #1e2630;
-  border-radius: 10px;
-  padding: 0.9rem 1rem;
+  background: rgba(7, 10, 15, 0.55);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 0.95rem 1.05rem;
   display: flex;
   flex-direction: column;
   gap: 0.75rem;
+  transition:
+    border-color var(--transition),
+    box-shadow var(--transition);
+}
+.grid-card:hover {
+  border-color: var(--border-strong);
 }
 .grid-card.selected {
-  border-color: rgba(56, 189, 248, 0.45);
-  box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.12);
+  border-color: var(--info-border);
+  box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.1);
 }
 .grid-card.chart-focus {
-  border-color: rgba(14, 203, 129, 0.4);
-  box-shadow: 0 0 0 1px rgba(14, 203, 129, 0.1);
-}
-.grid-card.selected.chart-focus {
-  border-color: rgba(56, 189, 248, 0.55);
+  border-color: var(--accent-border);
+  box-shadow: var(--shadow-glow-accent);
 }
 .grid-card-top {
   display: flex;
@@ -357,13 +360,18 @@ async function onStop() {
   flex: 1;
   min-width: 7rem;
   cursor: pointer;
-  border-radius: 8px;
-  border: 1px solid #1e2630;
-  padding: 0.45rem 0.65rem;
-  font-size: 0.8rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong);
+  padding: 0.48rem 0.68rem;
+  font-size: 0.78rem;
   font-weight: 600;
-  background: #12161c;
-  color: #e2e8f0;
+  font-family: inherit;
+  background: rgba(7, 10, 15, 0.65);
+  color: var(--text-secondary);
+  transition:
+    border-color var(--transition),
+    color var(--transition),
+    background var(--transition);
 }
 .btn-card.btn-chart {
   border-color: rgba(14, 203, 129, 0.35);

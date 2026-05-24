@@ -68,9 +68,12 @@ onBeforeUnmount(() => {
 
 <template>
   <section class="grid-cards-wrap panel" aria-label="الشبكات النشطة">
-    <header class="grid-cards-head">
-      <h2 class="grid-cards-title">الشبكات النشطة</h2>
-      <span class="grid-cards-count muted">{{ symbols.length }} زوج</span>
+    <header class="panel-header grid-cards-head">
+      <div>
+        <h2 class="panel-title">الشبكات النشطة</h2>
+        <p class="panel-subtitle">حالة كل شبكة · PnL · إجراءات سريعة</p>
+      </div>
+      <span class="grid-cards-count chip chip-env-mainnet">{{ symbols.length }} زوج</span>
     </header>
 
     <div class="grid-cards-grid">
@@ -89,27 +92,17 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .grid-cards-wrap {
-  padding: 1rem 1.1rem;
+  padding-top: 0.9rem;
 }
 .grid-cards-head {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 0.75rem;
   margin-bottom: 0.85rem;
 }
-.grid-cards-title {
-  margin: 0;
-  font-size: 0.95rem;
-  font-weight: 600;
-  color: #e2e8f0;
-}
 .grid-cards-count {
-  font-size: 0.78rem;
+  flex-shrink: 0;
 }
 .grid-cards-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-  gap: 0.85rem;
+  grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
+  gap: 0.75rem;
 }
 </style>

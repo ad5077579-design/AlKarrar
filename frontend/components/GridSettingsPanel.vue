@@ -243,12 +243,25 @@ onMounted(() => {
 </script>
 
 <template>
-  <section class="grid-panel" aria-label="إعدادات شبكة التداول">
-    <header class="grid-panel-head">
+  <section class="grid-panel panel" aria-label="إعدادات شبكة التداول">
+    <header class="grid-panel-head panel-header">
       <div class="head-left">
-        <h2 class="grid-panel-title">شبكة Spot</h2>
-        <span class="symbol-chip">{{ store.symbol }}</span>
-        <span v-if="store.credentialsConfigured" class="mode-chip" :class="store.binanceEnv || 'testnet'">
+        <div>
+          <h2 class="panel-title">شبكة Spot</h2>
+          <p class="panel-subtitle">إعدادات النطاق والتخصيص — {{ store.symbol }}</p>
+        </div>
+        <span class="chip chip-symbol">{{ store.symbol }}</span>
+        <span
+          v-if="store.credentialsConfigured"
+          class="chip"
+          :class="
+            store.binanceEnv === 'demo'
+              ? 'chip-env-demo'
+              : store.binanceEnv === 'mainnet'
+                ? 'chip-env-mainnet'
+                : 'chip-env-testnet'
+          "
+        >
           {{ store.spotEnvLabel }}
         </span>
       </div>
@@ -495,49 +508,25 @@ onMounted(() => {
 
 <style scoped>
 .grid-panel {
-  background: #1e2329;
-  border: 1px solid #2b3139;
-  border-radius: 8px;
   overflow: hidden;
+  padding: 0;
 }
 .grid-panel-head {
-  padding: 0.85rem 1rem;
-  border-bottom: 1px solid #2b3139;
-  background: #181a20;
+  margin-bottom: 0;
+  padding: 0.9rem 1.1rem;
+  border-bottom: 1px solid var(--border);
+  background: rgba(7, 10, 15, 0.45);
 }
 .head-left {
   display: flex;
   align-items: center;
-  gap: 0.5rem;
+  gap: 0.55rem;
   flex-wrap: wrap;
 }
-.grid-panel-title {
-  margin: 0;
-  font-size: 1rem;
-  font-weight: 600;
-  color: #eaecef;
-}
-.symbol-chip {
-  font-size: 0.78rem;
-  font-weight: 600;
-  padding: 0.15rem 0.45rem;
-  border-radius: 4px;
-  background: #2b3139;
-  color: #f0b90b;
-}
-.mode-chip {
-  font-size: 0.65rem;
-  font-weight: 700;
-  text-transform: uppercase;
-  padding: 0.12rem 0.4rem;
-  border-radius: 4px;
-  border: 1px solid rgba(240, 185, 11, 0.35);
-  color: #f0b90b;
-}
 .compound-toggle-row {
-  padding: 0.75rem 1rem;
-  border-bottom: 1px solid #2b3139;
-  background: rgba(240, 185, 11, 0.04);
+  padding: 0.75rem 1.1rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--warn-dim);
 }
 .toggle-wrap {
   display: flex;
@@ -601,8 +590,8 @@ onMounted(() => {
   }
 }
 .grid-form {
-  padding: 1rem;
-  border-inline-end: 1px solid #2b3139;
+  padding: 1rem 1.1rem;
+  border-inline-end: 1px solid var(--border);
 }
 .block-title {
   margin: 0 0 0.25rem;

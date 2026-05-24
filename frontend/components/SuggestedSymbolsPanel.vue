@@ -2,6 +2,14 @@
 import { computed, onMounted, onBeforeUnmount, ref, watch } from "vue"
 import { useBotStore, type SymbolSuggestion } from "~/stores/bot"
 
+const props = withDefaults(
+  defineProps<{
+    /** column = بجانب الشارت في تبويب المراقبة */
+    layout?: "inline" | "column"
+  }>(),
+  { layout: "inline" },
+)
+
 const store = useBotStore()
 const applying = ref<string | null>(null)
 
@@ -25,8 +33,12 @@ function formatVol(n: number): string {
 async function onApply(row: SymbolSuggestion) {
   if (applying.value) return
   applying.value = row.symbol
+  store.setDashboardTab("watch")
   try {
     await store.applySymbolSuggestion(row)
+    requestAnimationFrame(() => {
+      document.getElementById("trading-chart-panel")?.scrollIntoView({ behavior: "smooth", block: "nearest" })
+    })
   } catch (e) {
     alert(String(e))
   } finally {
@@ -58,7 +70,11 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <section class="suggested-panel" aria-label="العملات المقترحة">
+  <section
+    class="suggested-panel"
+    :class="{ 'suggested-panel--column': props.layout === 'column' }"
+    aria-label="العملات المقترحة"
+  >
     <div class="suggested-head">
       <h3 class="suggested-title">العملات المقترحة</h3>
       <button
@@ -127,12 +143,38 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
-.suggested-panel {
+.suggested-panel--column {
+  margin-top: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border: none;
+  background: transparent;
+  padding: 0;
+}
+.suggested-panel:not(.suggested-panel--column) {
   margin-top: 0.35rem;
-  padding: 0.55rem 0.45rem 0.5rem;
-  border-radius: 8px;
-  border: 1px solid rgba(14, 203, 129, 0.35);
-  background: rgba(14, 203, 129, 0.06);
+  padding: 0.65rem 0.75rem;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--accent-border);
+  background: var(--accent-dim);
+}
+.suggested-panel--column .suggested-list {
+  flex: 1;
+  max-height: none;
+  min-height: 8rem;
+}
+
+.suggested-panel--column .suggested-title {
+  display: none;
+}
+.suggested-panel--column .suggested-hint {
+  display: none;
+}
+.suggested-panel--column .suggested-head {
+  justify-content: flex-end;
+  margin-bottom: 0.25rem;
 }
 .suggested-head {
   display: flex;
@@ -184,20 +226,24 @@ onBeforeUnmount(() => {
   width: 100%;
   text-align: start;
   border: 1px solid transparent;
-  border-radius: 6px;
-  padding: 0.4rem 0.45rem;
-  margin-bottom: 0.25rem;
-  background: rgba(21, 26, 34, 0.75);
-  cursor: pointer;
+  border-radius: var(--radius-sm);
+  padding: 0.48rem 0.55rem;
+  margin-bottom: 0.22rem;
+  background: rgba(7, 10, 15, 0.35);
   color: inherit;
+  cursor: pointer;
+  font: inherit;
+  transition:
+    background var(--transition),
+    border-color var(--transition);
 }
 .suggested-row:hover:not(:disabled) {
-  border-color: rgba(14, 203, 129, 0.35);
-  background: rgba(14, 203, 129, 0.08);
+  background: rgba(24, 32, 48, 0.75);
+  border-color: var(--border);
 }
 .suggested-row.active {
-  border-color: rgba(56, 189, 248, 0.5);
-  background: rgba(56, 189, 248, 0.1);
+  background: var(--info-dim);
+  border-color: var(--info-border);
 }
 .suggested-row.pending {
   opacity: 0.65;

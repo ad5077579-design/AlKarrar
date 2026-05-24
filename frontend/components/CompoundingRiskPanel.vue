@@ -24,17 +24,21 @@ function fmtPct(n: number): string {
 
 <template>
   <section class="risk-panel panel" aria-label="مراقبة التكبير والمخاطر">
-    <h2 class="risk-title">التكبير والمخاطر</h2>
-    <p class="risk-sub muted">قراءة فقط — {{ isolatedLabel }}</p>
+    <header class="panel-header">
+      <div>
+        <h2 class="panel-title">التكبير والمخاطر</h2>
+        <p class="panel-subtitle">قراءة فقط — {{ isolatedLabel }}</p>
+      </div>
+    </header>
 
     <div class="risk-grid">
-      <div class="risk-card">
+      <div class="risk-card inner-card">
         <div class="risk-label">Peak Equity</div>
         <div class="risk-value">{{ fmtUsdt(peakDisplay) }} <span class="unit">USDT</span></div>
         <p class="risk-hint">أعلى equity للشبكة المعزولة</p>
       </div>
 
-      <div class="risk-card">
+      <div class="risk-card inner-card">
         <div class="risk-label">Current Drawdown</div>
         <div
           class="risk-value"
@@ -48,7 +52,7 @@ function fmtPct(n: number): string {
         <p class="risk-hint">من القمة الحالية</p>
       </div>
 
-      <div class="risk-card">
+      <div class="risk-card inner-card">
         <div class="risk-label">Realized PnL (محقق · مُعاد حقنه)</div>
         <div class="risk-value pnl-up">+{{ fmtUsdt(reinjectedDisplay) }} <span class="unit">USDT</span></div>
         <p class="risk-hint">أرباح الشبكة المحققة (FIFO)</p>
@@ -59,18 +63,7 @@ function fmtPct(n: number): string {
 
 <style scoped>
 .risk-panel {
-  background: #1e2329;
-  border-color: #2b3139;
-}
-.risk-title {
-  margin: 0 0 0.2rem;
-  font-size: 0.95rem;
-  font-weight: 600;
-  color: #eaecef;
-}
-.risk-sub {
-  margin: 0 0 0.85rem;
-  font-size: 0.72rem;
+  padding-top: 0.9rem;
 }
 .risk-grid {
   display: grid;
@@ -83,45 +76,42 @@ function fmtPct(n: number): string {
   }
 }
 .risk-card {
-  background: #181a20;
-  border: 1px solid #2b3139;
-  border-radius: 8px;
-  padding: 0.75rem 0.85rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
 }
 .risk-label {
-  font-size: 0.68rem;
+  font-size: 0.66rem;
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: #848e9c;
-  margin-bottom: 0.35rem;
+  letter-spacing: 0.07em;
+  color: var(--muted);
 }
 .risk-value {
-  font-size: 1.25rem;
-  font-weight: 700;
+  font-size: 1.2rem;
+  font-weight: 800;
+  letter-spacing: -0.02em;
   font-variant-numeric: tabular-nums;
-  color: #eaecef;
+  color: var(--text);
 }
 .risk-value .unit {
-  font-size: 0.72rem;
+  font-size: 0.7rem;
   font-weight: 600;
-  color: #848e9c;
+  color: var(--muted);
 }
 .risk-value.warn {
-  color: #f0b90b;
+  color: var(--warn);
 }
 .risk-value.bad {
-  color: #f6465d;
+  color: var(--danger);
 }
 .risk-value.pnl-up {
-  color: #0ecb81;
+  color: var(--accent);
 }
 .risk-hint {
-  margin: 0.35rem 0 0;
+  margin: 0.2rem 0 0;
   font-size: 0.68rem;
-  color: #5e6673;
-}
-.muted {
-  color: #848e9c;
+  color: var(--muted);
+  line-height: 1.35;
 }
 </style>

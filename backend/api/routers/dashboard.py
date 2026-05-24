@@ -89,6 +89,7 @@ class GridStartBody(BaseModel):
     profit_injection_mode: str | None = None
     max_slippage_pct: float | None = None
     dca_mode: str | None = None
+    adaptiveVolBand: bool | None = None
 
 
 class DashboardSettingsPatch(BaseModel):
@@ -108,6 +109,7 @@ class DashboardSettingsPatch(BaseModel):
     max_slippage_pct: float | None = None
     dca_mode: str | None = None
     autoCompoundingEnabled: bool | None = None
+    adaptiveVolBand: bool | None = None
 
     @model_validator(mode="after")
     def _validate(self) -> DashboardSettingsPatch:
@@ -165,6 +167,65 @@ def _merge_advanced_grid_settings(
     slip = pick("max_slippage_pct", None)
     if slip is not None:
         settings["max_slippage_pct"] = max(0.0, float(slip))
+    avb = pick("adaptiveVolBand", None)
+    if avb is not None:
+        settings["adaptiveVolBand"] = bool(avb)
+
+
+@router.get("/{bot_id}/grid/vol-profile")
+async def get_grid_vol_profile(
+    bot_id: str,
+    symbol: str = Query(..., min_length=1, description="Spot symbol, e.g. DOGEUSDT"),
+    band_span_pct: float | None = Query(None, alias="bandSpanPct", ge=2.0, le=20.0),
+    trailing_stop_pct: float = Query(0.01, alias="trailingStopPct", ge=0.002, le=0.08),
+) -> dict[str, Any]:
+    """ATR-based adaptive band profile (AVB) for UI / pre-flight tuning."""
+    from backend.api.volatility_band import AvbConfig, fetch_vol_profile
+
+    sym = symbol.strip().upper().replace("/", "")
+    if not sym:
+        raise HTTPException(status_code=400, detail="symbol must not be empty")
+
+    try:
+        k1, k2, env, _legacy = await get_binance_keys(bot_id)
+    except Exception as exc:
+        _log.exception("vol-profile: get_binance_keys failed")
+        raise HTTPException(status_code=503, detail=f"credentials lookup failed: {exc}") from exc
+
+    stream_env = env if (k1 and k2) else EngineSettings().resolved_binance_env()
+    cfg = AvbConfig.from_env()
+    base_span = float(band_span_pct) if band_span_pct is not None else cfg.base_band_span_pct
+
+    client: BinanceSpotClient | None = None
+    try:
+        client = await BinanceSpotClient.create_for_env(
+            api_key=k1,
+            api_secret=k2,
+            env=stream_env,
+        )
+        profile = await fetch_vol_profile(
+            client,
+            sym,
+            cfg=cfg,
+            base_band_span_pct=base_span,
+            base_trailing_stop_pct=float(trailing_stop_pct),
+        )
+    except BinanceAPIException as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Binance API {getattr(exc, 'code', '')}: {getattr(exc, 'message', str(exc))}",
+        ) from exc
+    except Exception as exc:
+        _log.exception("vol-profile fetch failed")
+        raise HTTPException(status_code=502, detail=f"{type(exc).__name__}: {exc}") from exc
+    finally:
+        if client is not None:
+            await client.aclose()
+
+    out = profile.to_api_dict()
+    out["adaptiveVolBand"] = cfg.enabled
+    out["binanceEnv"] = stream_env
+    return out
 
 
 @router.get("/{bot_id}/markets/suggestions")
@@ -625,6 +686,7 @@ async def grid_start(
             "profit_injection_mode",
             "max_slippage_pct",
             "dca_mode",
+            "adaptiveVolBand",
         )
         if k in settings
     }
@@ -679,6 +741,85 @@ async def grid_stop(bot_id: str, body: GridStopBody | None = None) -> dict[str, 
     return {"bot_id": bot_id, **st}
 
 
+_BAND_AUTOCAL_MAX_DEV = 0.35
+_BAND_AUTOCAL_SPAN_PCT = 3.5
+
+
+async def _fetch_symbol_mark(bot_id: str, sym: str) -> float:
+    from backend.api.binance_pool import get_spot_client
+
+    client = await get_spot_client(bot_id)
+    if client is None:
+        return 0.0
+    tick = await client.fetch_ticker(sym)
+    return float(tick.get("price") or tick.get("lastPrice") or 0)
+
+
+async def _autocalibrate_band_if_stale(
+    *,
+    bot_id: str,
+    sym: str,
+    cfg: dict[str, Any],
+    row: BotSettings,
+    db: AsyncSession,
+    merged: dict[str, Any],
+    mark: float | None = None,
+) -> dict[str, Any]:
+    """Persist a mark-centered band when the stored midpoint is far from live price."""
+    from backend.api.spot_realized_ledger import band_from_mark_span, band_mid_deviation_pct
+    from backend.core.exchange_filters import fetch_symbol_filters
+
+    live_mark = float(mark if mark is not None else merged.get("markPrice") or 0)
+    if live_mark <= 0:
+        live_mark = await _fetch_symbol_mark(bot_id, sym)
+    if live_mark <= 0:
+        return merged
+
+    upper = float(merged.get("generatorUpper") or cfg.get("generatorUpper") or 0)
+    lower = float(merged.get("generatorLower") or cfg.get("generatorLower") or 0)
+    dev = band_mid_deviation_pct(
+        generator_upper=upper,
+        generator_lower=lower,
+        mark_price=live_mark,
+    )
+    merged = await hub.merge_room(sym, {"markPrice": live_mark, "symbol": sym})
+    if dev <= _BAND_AUTOCAL_MAX_DEV:
+        return merged
+
+    from backend.api.binance_pool import get_spot_client
+
+    client = await get_spot_client(bot_id)
+    filt: dict[str, Any] = {}
+    if client is not None:
+        filt = await fetch_symbol_filters(client, sym)
+    lo, hi = band_from_mark_span(
+        live_mark,
+        span_pct=_BAND_AUTOCAL_SPAN_PCT,
+        tick_size=float(filt.get("tick_size") or 0),
+    )
+    trail = max(live_mark * 0.002, float(filt.get("tick_size") or 0) or 1e-8)
+    band_patch = {
+        "generatorLower": lo,
+        "generatorUpper": hi,
+        "trailingOffset": trail,
+    }
+    cfg.update(band_patch)
+    row.config_json = cfg
+    row.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+    merged = await hub.merge_state({**band_patch, "symbol": sym})
+    merged = await hub.merge_room(sym, {"markPrice": live_mark, "symbol": sym})
+    _log.info(
+        "auto-calibrated band for %s mark=%.8g lo=%.8g hi=%.8g dev=%.2f",
+        sym,
+        live_mark,
+        lo,
+        hi,
+        dev,
+    )
+    return merged
+
+
 @router.get("/{bot_id}/dashboard")
 async def get_dashboard(
     bot_id: str,
@@ -709,6 +850,19 @@ async def get_dashboard(
         "autoCompoundingEnabled",
         str(merged.get("profit_injection_mode", "compound_size")).lower() == "compound_size",
     )
+    if sym_q and row is not None:
+        try:
+            merged = await _autocalibrate_band_if_stale(
+                bot_id=bot_id,
+                sym=sym_q,
+                cfg=cfg,
+                row=row,
+                db=db,
+                merged=merged,
+            )
+            await apply_credentials_meta(bot_id, merged)
+        except Exception:
+            _log.debug("get_dashboard band autocal for %s skipped", sym_q, exc_info=True)
     return merged
 
 
@@ -853,51 +1007,17 @@ async def patch_settings(
     sym = str(merged.get("symbol") or hub.last_focus_symbol or "").strip().upper().replace("/", "")
     if sym:
         try:
-            from backend.api.binance_pool import get_spot_client
-            from backend.api.spot_realized_ledger import band_from_mark_span, band_mid_deviation_pct
-            from backend.core.exchange_filters import fetch_symbol_filters
-
-            client = await get_spot_client(bot_id)
-            if client is not None:
-                tick = await client.fetch_ticker(sym)
-                mark = float(tick.get("price") or tick.get("lastPrice") or 0)
-                if mark > 0:
-                    merged = await hub.merge_room(sym, {"markPrice": mark, "symbol": sym})
-                    symbol_changed = "symbol" in patch
-                    upper = float(merged.get("generatorUpper") or 0)
-                    lower = float(merged.get("generatorLower") or 0)
-                    if symbol_changed and band_mid_deviation_pct(
-                        generator_upper=upper,
-                        generator_lower=lower,
-                        mark_price=mark,
-                    ) > 0.35:
-                        filt = await fetch_symbol_filters(client, sym)
-                        lo, hi = band_from_mark_span(
-                            mark,
-                            span_pct=3.5,
-                            tick_size=float(filt.get("tick_size") or 0),
-                        )
-                        trail = max(mark * 0.002, float(filt.get("tick_size") or 0) or 1e-8)
-                        band_patch = {
-                            "generatorLower": lo,
-                            "generatorUpper": hi,
-                            "trailingOffset": trail,
-                        }
-                        cfg.update(band_patch)
-                        row.config_json = cfg
-                        row.updated_at = datetime.now(timezone.utc)
-                        await db.commit()
-                        merged = await hub.merge_state(band_patch)
-                        _log.info(
-                            "auto-calibrated band for %s mark=%.8g lo=%.8g hi=%.8g",
-                            sym,
-                            mark,
-                            lo,
-                            hi,
-                        )
-                    await apply_credentials_meta(bot_id, merged)
+            merged = await _autocalibrate_band_if_stale(
+                bot_id=bot_id,
+                sym=sym,
+                cfg=cfg,
+                row=row,
+                db=db,
+                merged=merged,
+            )
+            await apply_credentials_meta(bot_id, merged)
         except Exception:
-            _log.debug("patch_settings mark fetch for %s skipped", sym, exc_info=True)
+            _log.debug("patch_settings band autocal for %s skipped", sym, exc_info=True)
         await hub.broadcast_room(
             sym,
             {"type": "settings", "data": merged},
@@ -913,7 +1033,7 @@ async def patch_settings(
         )
     else:
         await hub.broadcast({"type": "settings", "data": merged})
-    await spot_account_sync.sync_spot_account_to_hub_once(bot_id)
+    asyncio.create_task(spot_account_sync.sync_spot_account_to_hub_once(bot_id))
     snap = dict(merged)
     snap["bot_id"] = bot_id
     return snap

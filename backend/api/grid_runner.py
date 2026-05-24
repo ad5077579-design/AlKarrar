@@ -121,6 +121,8 @@ class GridRunner:
             st["lastAvailableUsdt"] = round(float(getattr(self._strategy, "_last_available_usdt", 0.0)), 8)
             st["allocatedCapital"] = round(float(self._allocated_capital), 8)
             st["deployCapitalUsdt"] = round(self.effective_deploy_capital_usdt(), 8)
+            if hasattr(self._strategy, "vol_profile_snapshot"):
+                st["volProfile"] = self._strategy.vol_profile_snapshot()
         st["gridEquityUsdt"] = 0.0
         st["unrealizedPnlUsdt"] = 0.0
         if self._running:

@@ -474,6 +474,12 @@ def log_from_audit_event(
             d.get("shift_reason")
             or "رفع النطاق — السعر تجاوز generatorUpper أو إغلاق آخر خط بيع علوي"
         )
+    elif event_type == "VOL_BAND_RECALIBRATE":
+        action = "GRID_REARM"
+        reason = str(
+            d.get("shift_reason")
+            or "إعادة معايرة النطاق حسب تذبذب ATR (AVB)"
+        )
     elif event_type in ("VIRTUAL_GRID_FILL", "TAKE_PROFIT_MARKET"):
         return
     elif event_type == "PROFIT_INJECT_COMPOUND":

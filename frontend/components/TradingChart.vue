@@ -30,6 +30,7 @@ import {
 } from "~/utils/chartTradeMarkers"
 import {
   buildSessionBandPoints,
+  bandMatchesMark,
   envHostHint,
   envTradingLabelAr,
   formatSessionDuration,
@@ -120,7 +121,7 @@ function tradePriceAutoscaleInfo(): AutoscaleInfo | null {
     min = Math.min(min, c.low as number)
     max = Math.max(max, c.high as number)
   }
-  const mp = store.markPrice
+  const mp = chartMarkPrice.value
   if (mp > 0) {
     min = Math.min(min, mp)
     max = Math.max(max, mp)
@@ -142,6 +143,39 @@ const AUTOSCALE_FROM_CANDLES = () => tradePriceAutoscaleInfo()
 
 const gridMetaHere = computed(() => store.selectedGridMeta)
 
+function resolveKlinesSymbol(): string {
+  const s = String(store.symbol ?? "")
+    .trim()
+    .toUpperCase()
+    .replace("/", "")
+  if (/^[A-Z0-9]{4,}$/.test(s)) return s
+  return "DOGEUSDT"
+}
+
+const chartMarkPrice = computed(() => {
+  const sym = resolveKlinesSymbol()
+  const room = store.symbolMark(sym)
+  if (room > 0) return room
+  return store.markPrice
+})
+
+/** Grid band only when it matches the symbol's live mark (avoids squashing OHLC). */
+const effectiveGridBand = computed(() => {
+  const hi = store.generatorUpper
+  const lo = store.generatorLower
+  const mark = chartMarkPrice.value
+  if (!(hi > lo) || !(mark > 0)) return null
+  if (!bandMatchesMark(hi, lo, mark)) return null
+  return { hi, lo }
+})
+
+const bandStaleForChart = computed(() => {
+  const hi = store.generatorUpper
+  const lo = store.generatorLower
+  const mark = chartMarkPrice.value
+  return hi > lo && mark > 0 && !bandMatchesMark(hi, lo, mark)
+})
+
 const chartSessionSince = computed(() => {
   if (!store.isGridActiveForSelectedSymbol) return ""
   return gridMetaHere.value?.startedAt?.trim() ?? ""
@@ -155,10 +189,10 @@ const tradeStats = computed(() => {
 })
 
 const markInsideBand = computed(() => {
-  const m = store.markPrice
-  const hi = store.generatorUpper
-  const lo = store.generatorLower
-  return hi > lo && m >= lo && m <= hi
+  const band = effectiveGridBand.value
+  if (!band) return false
+  const m = chartMarkPrice.value
+  return m >= band.lo && m <= band.hi
 })
 
 const spotEnv = computed((): SpotEnvKind =>
@@ -234,9 +268,11 @@ function rebuildPriceLines() {
   const s = seriesForPriceLines()
   if (!s) return
   clearPriceLines()
+  const band = effectiveGridBand.value
+  if (!band || !showGridLines.value) return
   const next: object[] = []
-  const hi = store.generatorUpper
-  const lo = store.generatorLower
+  const hi = band.hi
+  const lo = band.lo
   if (Number.isFinite(hi) && hi > 0) {
     next.push(
       s.createPriceLine({
@@ -260,8 +296,7 @@ function rebuildPriceLines() {
     )
   }
   const levels = showGridLines.value ? store.gridLevels : []
-  const mid =
-    Number.isFinite(hi) && Number.isFinite(lo) && hi > lo ? (hi + lo) / 2 : 0
+  const mid = hi > lo ? (hi + lo) / 2 : 0
   if (mid > 0) {
     next.push(
       s.createPriceLine({
@@ -587,16 +622,6 @@ function applyMarkData() {
 function klinesUrl(botId: string, base: string): string {
   const prefix = base === "" ? "" : base.replace(/\/$/, "")
   return `${prefix}/api/bots/${encodeURIComponent(botId)}/klines`
-}
-
-/** Normalized Spot symbol for klines (backend rejects missing symbol). */
-function resolveKlinesSymbol(): string {
-  const s = String(store.symbol ?? "")
-    .trim()
-    .toUpperCase()
-    .replace("/", "")
-  if (/^[A-Z0-9]{4,}$/.test(s)) return s
-  return "DOGEUSDT"
 }
 
 /**
@@ -1137,23 +1162,31 @@ onBeforeUnmount(() => {
 .chart-toolbar {
   display: flex;
   align-items: center;
-  gap: 0.75rem;
+  gap: 0.65rem;
   flex-wrap: wrap;
-  margin-bottom: 0.5rem;
+  margin-bottom: 0.55rem;
+  padding: 0.45rem 0.55rem;
+  border-radius: var(--radius-sm);
+  background: rgba(7, 10, 15, 0.45);
+  border: 1px solid var(--border);
 }
 .chart-reset-btn {
   cursor: pointer;
-  border: 1px solid var(--border, #1e2630);
-  border-radius: 6px;
-  padding: 0.35rem 0.65rem;
-  font-size: 0.78rem;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 0.32rem 0.62rem;
+  font-size: 0.74rem;
   font-weight: 600;
-  background: #0f1318;
-  color: #e2e8f0;
+  font-family: inherit;
+  background: rgba(15, 19, 24, 0.85);
+  color: var(--text-secondary);
+  transition:
+    border-color var(--transition),
+    color var(--transition);
 }
 .chart-reset-btn:hover {
-  border-color: #38bdf8;
-  color: #38bdf8;
+  border-color: var(--info-border);
+  color: var(--info);
 }
 .chart-legend {
   display: flex;
@@ -1238,13 +1271,13 @@ onBeforeUnmount(() => {
   flex-wrap: wrap;
   align-items: center;
   gap: 0.35rem 0.5rem;
-  margin-bottom: 0.45rem;
-  padding: 0.4rem 0.65rem;
-  border-radius: 8px;
-  font-size: 0.72rem;
+  margin-bottom: 0.5rem;
+  padding: 0.45rem 0.7rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.7rem;
   font-weight: 600;
-  border: 1px solid rgba(30, 38, 48, 0.9);
-  background: linear-gradient(180deg, rgba(15, 19, 24, 0.95), rgba(11, 14, 17, 0.88));
+  border: 1px solid var(--border);
+  background: rgba(12, 16, 23, 0.85);
 }
 .chart-live-bar.env-demo {
   border-color: rgba(56, 189, 248, 0.35);

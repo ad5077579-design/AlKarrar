@@ -43,6 +43,19 @@ from backend.api.audit_log_service import (
     TRAILING_STARTED,
     schedule_bot_audit_event,
 )
+from backend.api.volatility_band import (
+    VOL_BAND_RECALIBRATE,
+    AvbConfig,
+    band_span_pct,
+    effective_band_span_pct,
+    effective_lift_offset,
+    effective_trailing_stop_pct,
+    fetch_vol_profile,
+    min_edge_spacing_pct,
+    spacing_passes_fee_gate,
+    span_change_pct_enough,
+    try_band_for_vol_recalibrate,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -272,6 +285,16 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
         self._session_base_inventory: float = 0.0
         self._lines_with_confirmed_buy: set[int] = set()
         self._line_ioc_cooldown_until: dict[int, float] = {}
+        self._avb_cfg = AvbConfig.from_env()
+        self._avb_enabled = False
+        self._avb_base_band_span_pct = 7.0
+        self._avb_base_trailing_stop_pct = 0.01
+        self._avb_base_lift_offset = 0.0
+        self._avb_last_recal_mono = 0.0
+        self._avb_io_busy = False
+        self._avb_last_atr_pct = 0.0
+        self._avb_effective_span_pct = 0.0
+        self._avb_min_edge_spacing_pct = 0.0
 
     async def on_start(self, bot_id: str, settings: dict[str, Any]) -> None:
         if not isinstance(self._exchange, BinanceSpotClient):
@@ -354,6 +377,23 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
         default_lift = max(upper * 1.0e-4, (upper - lower) * 0.02)
         self._lift_above_offset = float(settings.get("lift_above_offset", default_lift))
         self._trailing_stop_pct = float(settings.get("trailing_stop_pct", 0.01))
+        self._avb_cfg = AvbConfig.from_env(settings=settings)
+        self._avb_enabled = bool(self._avb_cfg.enabled)
+        mid_band = (upper + lower) / 2.0
+        self._avb_base_band_span_pct = (
+            float(settings.get("avbBaseBandSpanPct"))
+            if settings.get("avbBaseBandSpanPct") is not None
+            else (band_span_pct(upper, lower) if mid_band > 0 else self._avb_cfg.base_band_span_pct)
+        )
+        self._avb_base_trailing_stop_pct = float(self._trailing_stop_pct)
+        self._avb_base_lift_offset = float(self._lift_above_offset)
+        self._avb_effective_span_pct = float(self._avb_base_band_span_pct)
+        self._avb_min_edge_spacing_pct = min_edge_spacing_pct(
+            min_profit_margin=self._avb_cfg.min_profit_margin_pct,
+        )
+        self._avb_last_recal_mono = 0.0
+        self._avb_io_busy = False
+        self._avb_last_atr_pct = 0.0
         self._boundary_epsilon_pct = float(settings.get("boundary_epsilon_pct", 0.0005))
         self._boundary_reinvest_frac = float(settings.get("boundary_reinvest_frac", 0.25))
         self._lot_expand_step_pct = float(settings.get("lot_expand_step_pct", 0.05))
@@ -394,12 +434,17 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
         else:
             asyncio.create_task(self._bootstrap_open_grid(), name="shifting-grid-bootstrap")
 
+        if self._avb_enabled and mark_px > 0:
+            self._avb_last_recal_mono = 0.0
+            asyncio.create_task(self._io_avb_recalibrate(mark_px), name="avb-initial")
+
     async def on_stop(self, bot_id: str) -> None:
         self._running = False
         self._asymmetric_shift_active = False
         self._session_base_inventory = 0.0
         self._lines_with_confirmed_buy = set()
         self._line_ioc_cooldown_until = {}
+        self._avb_io_busy = False
         self._line_fill_mutex.clear()
         self._filled_order_ids.clear()
         self._persisted_grid_settings = {}
@@ -456,6 +501,7 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
             if self._recenter_grid_on_pivot(price, reason="price_breakout"):
                 asyncio.create_task(self._io_dynamic_lift(), name="shifting-lift-io")
 
+        self._maybe_schedule_avb_recalibrate(price)
         self._trailing_eval(price)
         for idx, snap in self._consume_trailing_exits(price):
             asyncio.create_task(self._exit_line_market(idx, snap), name=f"trail-exit-{idx}")
@@ -606,6 +652,13 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
             return
         if float(qty_s) <= 0 or float(price_s) <= 0:
             return
+        levels = self._rebuild_levels()
+        if self._avb_enabled and not spacing_passes_fee_gate(
+            levels,
+            sell_idx,
+            min_edge=self._avb_min_edge_spacing_pct,
+        ):
+            return
         lo = self._ram.generatorLower
         hi = self._ram.generatorUpper
         span = max(hi - lo, 1e-12)
@@ -695,9 +748,17 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
         span = max(hi - lo, 1e-12)
         registered = 0
 
+        levels_all = self._rebuild_levels()
+
         def _register_row(idx: int, px: float, side: Side) -> None:
             nonlocal registered
             if idx in triggered_idx:
+                return
+            if self._avb_enabled and not spacing_passes_fee_gate(
+                levels_all,
+                idx,
+                min_edge=self._avb_min_edge_spacing_pct,
+            ):
                 return
             try:
                 price_s, qty_s = self._normalize_order(px, qty_eff)
@@ -737,6 +798,160 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
                 "mark": mark,
             },
         )
+
+    def vol_profile_snapshot(self) -> dict[str, Any]:
+        return {
+            "adaptiveVolBand": bool(self._avb_enabled),
+            "atrPct": round(float(self._avb_last_atr_pct), 4),
+            "effectiveBandSpanPct": round(float(self._avb_effective_span_pct), 4),
+            "baseBandSpanPct": round(float(self._avb_base_band_span_pct), 4),
+            "trailingStopPct": round(float(self._trailing_stop_pct), 6),
+            "baseTrailingStopPct": round(float(self._avb_base_trailing_stop_pct), 6),
+            "liftAboveOffset": round(float(self._lift_above_offset), 8),
+            "minEdgeSpacingPct": round(float(self._avb_min_edge_spacing_pct) * 100.0, 4),
+        }
+
+    def _avb_has_active_trailing(self) -> bool:
+        for st in self._ram.line_trail.values():
+            if st.phase in (LineTrailPhase.lock_profit, LineTrailPhase.trailing):
+                return True
+        return False
+
+    def _can_recalibrate_vol_band(self) -> bool:
+        if not self._avb_enabled or not self._running:
+            return False
+        if self._avb_io_busy:
+            return False
+        if self._line_fill_mutex:
+            return False
+        if self._avb_has_active_trailing():
+            return False
+        return True
+
+    def _maybe_schedule_avb_recalibrate(self, price: float) -> None:
+        if not self._avb_enabled or price <= 0:
+            return
+        now = time.monotonic()
+        if now - self._avb_last_recal_mono < max(self._avb_cfg.recal_interval_s, 60.0):
+            return
+        if not self._can_recalibrate_vol_band():
+            return
+        self._avb_last_recal_mono = now
+        asyncio.create_task(self._io_avb_recalibrate(price), name="avb-vol-recal")
+
+    def _apply_avb_trailing_params(self, atr_pct: float) -> None:
+        band_w = max(float(self._ram.generatorUpper) - float(self._ram.generatorLower), 1e-12)
+        self._trailing_stop_pct = effective_trailing_stop_pct(
+            self._avb_base_trailing_stop_pct,
+            atr_pct,
+            self._avb_cfg,
+        )
+        self._lift_above_offset = effective_lift_offset(
+            self._avb_base_lift_offset,
+            band_w,
+            atr_pct,
+            self._avb_cfg,
+        )
+        self._avb_effective_span_pct = effective_band_span_pct(
+            self._avb_base_band_span_pct,
+            atr_pct,
+            self._avb_cfg,
+        )
+        self._avb_min_edge_spacing_pct = min_edge_spacing_pct(
+            min_profit_margin=self._avb_cfg.min_profit_margin_pct,
+        )
+
+    def _recenter_band_for_vol(self, mark: float, span_pct: float) -> bool:
+        alloc = max(
+            float(getattr(self, "_allocated_capital_usdt", 0.0) or self._ram.initialCapital),
+            0.0,
+        )
+        tick = float(self._filters.get("tick_size") or 0)
+        band_pair = try_band_for_vol_recalibrate(
+            mark=mark,
+            span_pct=span_pct,
+            tick_size=tick,
+            generator_count=int(self._ram.generatorCount),
+            allocated_capital=alloc,
+        )
+        if band_pair is None:
+            return False
+        new_lower, new_upper = band_pair
+        cur_span = band_span_pct(self._ram.generatorUpper, self._ram.generatorLower)
+        if not span_change_pct_enough(cur_span, span_pct, self._avb_cfg.recal_span_change_pct):
+            return False
+        eps = self._upper_band_epsilon()
+        if (
+            abs(new_upper - self._ram.generatorUpper) < eps
+            and abs(new_lower - self._ram.generatorLower) < eps
+        ):
+            return False
+
+        old_upper = float(self._ram.generatorUpper)
+        old_lower = float(self._ram.generatorLower)
+        self._ram.generatorUpper = float(new_upper)
+        self._ram.generatorLower = float(new_lower)
+        levels = self._rebuild_levels()
+        self._sync_line_trail_to_levels(levels)
+        self._retarget_idle_tp_after_band_shift(levels)
+        self._audit(
+            VOL_BAND_RECALIBRATE,
+            details={
+                "shift_reason": "vol_recalibrate",
+                "atr_pct": round(float(self._avb_last_atr_pct), 4),
+                "effective_band_span_pct": round(float(span_pct), 4),
+                "generatorUpper_before": old_upper,
+                "generatorLower_before": old_lower,
+                "generatorUpper_after": float(new_upper),
+                "generatorLower_after": float(new_lower),
+                "trailing_stop_pct": float(self._trailing_stop_pct),
+                "lift_above_offset": float(self._lift_above_offset),
+                "mark": float(mark),
+            },
+        )
+        _log.info(
+            "avb recenter span=%.3f%% upper=%s lower=%s atr=%.3f%%",
+            span_pct,
+            new_upper,
+            new_lower,
+            self._avb_last_atr_pct,
+        )
+        return True
+
+    async def _io_avb_recalibrate(self, mark: float) -> None:
+        if not isinstance(self._exchange, BinanceSpotClient) or not self._running:
+            return
+        if self._avb_io_busy:
+            return
+        self._avb_io_busy = True
+        try:
+            profile = await fetch_vol_profile(
+                self._exchange,
+                self._symbol,
+                cfg=self._avb_cfg,
+                base_band_span_pct=self._avb_base_band_span_pct,
+                base_trailing_stop_pct=self._avb_base_trailing_stop_pct,
+            )
+            self._avb_last_atr_pct = float(profile.atr_pct)
+            self._apply_avb_trailing_params(self._avb_last_atr_pct)
+            mk = float(mark or self._ram.last_price or 0)
+            if mk <= 0:
+                return
+            if not self._can_recalibrate_vol_band():
+                return
+            span_changed = self._recenter_band_for_vol(mk, profile.effective_band_span_pct)
+            if span_changed and self._virtual_book:
+                self._rearm_virtual_ladder(reason="vol_recalibrate", mode="full")
+            elif self._virtual_book:
+                self._rearm_virtual_ladder(reason="vol_params_only", mode="qty_only")
+        except Exception as exc:
+            _log.warning("avb recalibrate failed: %s", exc)
+            self._audit(
+                SYSTEM_ERROR,
+                details={"context": "avb_recalibrate", "error": str(exc)[:500]},
+            )
+        finally:
+            self._avb_io_busy = False
 
     def _reference_price(self, price: float, *, mark: float | None = None) -> float:
         """Conservative notional reference: never under-price vs live mark (prevents oversized base qty)."""
@@ -1280,6 +1495,11 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
             "dcaMode": self._dca_mode,
             "lift_above_offset": float(self._lift_above_offset),
             "trailing_stop_pct": float(self._trailing_stop_pct),
+            "adaptiveVolBand": bool(self._avb_enabled),
+            "avbBaseBandSpanPct": float(self._avb_base_band_span_pct),
+            "avbEffectiveBandSpanPct": float(self._avb_effective_span_pct),
+            "avbLastAtrPct": float(self._avb_last_atr_pct),
+            "avbMinEdgeSpacingPct": float(self._avb_min_edge_spacing_pct),
         }
 
     def _restore_from_snapshot(self, snap: dict[str, Any]) -> None:
@@ -1307,6 +1527,18 @@ class AlKarrarProShiftingGridStrategy(BaseStrategy):
         self._ram.injections_done = int(snap.get("injections_done") or 0)
         self._ram.last_price = float(snap.get("last_price") or 0)
         self._last_available_usdt = float(snap.get("lastAvailableUsdt") or self._last_available_usdt)
+        if snap.get("adaptiveVolBand") is not None:
+            self._avb_enabled = bool(snap.get("adaptiveVolBand"))
+        if snap.get("avbBaseBandSpanPct") is not None:
+            self._avb_base_band_span_pct = float(snap.get("avbBaseBandSpanPct"))
+        if snap.get("avbEffectiveBandSpanPct") is not None:
+            self._avb_effective_span_pct = float(snap.get("avbEffectiveBandSpanPct"))
+        if snap.get("avbLastAtrPct") is not None:
+            self._avb_last_atr_pct = float(snap.get("avbLastAtrPct"))
+        if snap.get("trailing_stop_pct") is not None:
+            self._trailing_stop_pct = float(snap.get("trailing_stop_pct"))
+        if snap.get("lift_above_offset") is not None:
+            self._lift_above_offset = float(snap.get("lift_above_offset"))
         self._asymmetric_shift_active = bool(snap.get("asymmetricShiftActive"))
         self._upper_sell_armed_count = int(snap.get("upperSellArmedCount") or 0)
         self._upper_sell_completed = int(snap.get("upperSellCompleted") or 0)
